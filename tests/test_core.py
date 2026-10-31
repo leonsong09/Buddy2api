@@ -369,6 +369,7 @@ def _collect_chat_proxy_stream(
             return FakeResponse()
 
     account = {"id": 1, "name": "test-account"}
+    monkeypatch.setattr(db, "list_accounts", lambda **kwargs: [account])
 
     async def pick_account(_excluded, **kwargs):
         return account
@@ -424,6 +425,7 @@ def _install_chat_account_stream_fakes(
     accounts: list[dict],
     streams: dict[int, list[bytes]],
 ) -> dict:
+    monkeypatch.setattr(db, "list_accounts", lambda **kwargs: accounts)
     calls = {
         "picks": [],
         "failures": [],
