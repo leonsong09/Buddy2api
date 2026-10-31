@@ -135,6 +135,7 @@ def _patch_upstream(monkeypatch, responses):
     from providers.xiaohuanxiong import chat
 
     queue = list(responses)
+    monkeypatch.setattr(db, "list_accounts", lambda **kwargs: [{"id": 9, "status": "active"}])
     logs = []
 
     class Client:

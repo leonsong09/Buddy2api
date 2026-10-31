@@ -1195,6 +1195,17 @@ def workbuddy_channel_for_domain(domain: str) -> str:
     return "workbuddy"
 
 
+def account_attempt_limit(provider: str, *, refresh_retry: bool = False) -> int:
+    """Budget for the whole channel pool, including refreshable expired accounts.
+
+    Keep the existing minimum for refresh attempts; never cap a larger pool at three.
+    TraeWork may retry each account once after renewing its credentials.
+    """
+    count = sum(a.get("status") in {"active", "expired"}
+                for a in db.list_accounts(provider=provider))
+    return max(3, count * (2 if refresh_retry else 1))
+
+
 def pick_account(
     exclude_ids: set[int] = None,
     provider: str = "workbuddy",
