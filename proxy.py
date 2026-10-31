@@ -804,6 +804,7 @@ def _log_request(api_key_info, account, model_name, stream,
         or (api_key_info.get("_bind_channel") if api_key_info else None)
         or "workbuddy",
         "model": model_name,
+        "resolved_model": (api_key_info or {}).get("_resolved_model", ""),
         "stream": 1 if stream else 0,
         "prompt_tokens": prompt_t,
         "completion_tokens": completion_t,
@@ -872,7 +873,7 @@ async def _json_chat_with_stall_retry(
     provider: str = "workbuddy",
 ) -> tuple:
     tried_ids: set[int] = set()
-    max_retries = 3
+    max_retries = auth_manager.account_attempt_limit(provider)
     last_error = None
 
     for attempt in range(max_retries):
@@ -1075,7 +1076,8 @@ async def _stream_upstream(
     last_started = time.time()
     pending_retry_log: dict | None = None
 
-    for attempt in range(3):
+    max_attempts = auth_manager.account_attempt_limit(provider)
+    for attempt in range(max_attempts):
         account = await auth_manager.pick_account_with_fallback(tried_ids, provider=provider)
         if not account:
             break
@@ -1142,7 +1144,7 @@ async def _stream_upstream(
                             last_error_event = client_detail if isinstance(client_detail, dict) else None
                             last_status = client_status
                             last_failure = ruled_failure
-                            if action == "stop" or attempt >= 2:
+                            if action == "stop" or attempt >= max_attempts - 1:
                                 _log_request(
                                     api_key_info, account, model_name, True,
                                     0, 0, 0, 0, ruled_failure, client_status,
@@ -1172,7 +1174,7 @@ async def _stream_upstream(
                         last_status = response.status_code
                         last_failure = failure
                         auth_manager.mark_account_failure(account["id"], response.status_code)
-                        if _is_retryable_status(response.status_code) and attempt < 2:
+                        if _is_retryable_status(response.status_code) and attempt < max_attempts - 1:
                             pending_retry_log = {
                                 "account": account,
                                 "prompt_tokens": 0,
@@ -1232,7 +1234,7 @@ async def _stream_upstream(
             last_status = 502
             last_failure = failure
             auth_manager.mark_account_failure(account["id"], 502)
-            if not output_started and attempt < 2:
+            if not output_started and attempt < max_attempts - 1:
                 pending_retry_log = {
                     "account": account,
                     "prompt_tokens": 0,
@@ -1283,7 +1285,7 @@ async def _stream_upstream(
             last_status = 502
             last_failure = failure
             auth_manager.mark_account_failure(account["id"], 502)
-            if not output_started and attempt < 2:
+            if not output_started and attempt < max_attempts - 1:
                 pending_retry_log = {
                     "account": account,
                     "prompt_tokens": observer.usage.get("prompt_tokens", 0),
