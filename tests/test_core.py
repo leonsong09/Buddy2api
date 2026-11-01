@@ -132,8 +132,14 @@ def test_build_backend_body_does_not_duplicate_existing_system(monkeypatch):
         ],
     })
 
-    assert [message["role"] for message in body["messages"]] == ["system", "user"]
-    assert body["messages"][0]["content"] == "already here"
+    # The client's own system text is preserved (folded into the first user as
+    # <client_instructions>) and exactly one canonical upstream system remains.
+    systems = [message for message in body["messages"] if message["role"] == "system"]
+    assert len(systems) == 1
+    assert systems[0]["content"] == proxy._CANONICAL_UPSTREAM_SYSTEM
+    user = next(message for message in body["messages"] if message["role"] == "user")
+    assert "already here" in user["content"]
+    assert "client_instructions" in user["content"]
 
 
 @pytest.mark.parametrize("value", ["off", "none", "false", "0"])
@@ -3307,11 +3313,25 @@ def test_non_stream_proxy_fails_over_on_retryable_upstream(isolated_db, monkeypa
         }
     )
     account = db.get_account(account_id)
+    backup_id = db.add_account(
+        {
+            "name": "backup",
+            "access_token": "access-2",
+            "refresh_token": "refresh-2",
+            "expires_at": 9_999_999_999_999,
+        }
+    )
+    backup = db.get_account(backup_id)
     calls = []
 
     async def pick(exclude, **kwargs):
         calls.append("pick")
-        return account
+        # Real pickers honour the exclusion set; models that hand back an
+        # already-tried account would retry it forever.
+        for candidate in (account, backup):
+            if candidate["id"] not in (exclude or set()):
+                return candidate
+        return None
 
     async def headers(value):
         return {"Authorization": "Bearer access"}

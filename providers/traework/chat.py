@@ -350,8 +350,12 @@ def _log(api_key_info, account, model_name, stream, finish, status, error, t0, u
                 "account_id": account["id"] if account else None,
                 "account_name": account.get("name") if account else None,
                 "provider": CHANNEL_ID,
-                "model": (api_key_info or {}).get("_log_model", model_name),
-                "resolved_model": (api_key_info or {}).get("_resolved_model", ""),
+                # The alias the client sent, not the translated id: every other
+                # provider reads `_log_model` at the call site, this one logs here.
+                "model": (api_key_info.get("_log_model")
+                          if isinstance(api_key_info, dict) else None) or model_name,
+                "resolved_model": (api_key_info.get("_resolved_model")
+                                   if isinstance(api_key_info, dict) else None) or model_name,
                 "stream": 1 if stream else 0,
                 "prompt_tokens": usage.get("prompt_tokens", 0),
                 "completion_tokens": usage.get("completion_tokens", 0),

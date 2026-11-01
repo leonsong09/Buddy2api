@@ -48,7 +48,8 @@ def _log(api_key_info, account, model_name, stream, prompt_t, completion_t, tota
                 "account_name": account.get("name") if account else None,
                 "provider": CHANNEL_ID,
                 "model": model_name,
-                "resolved_model": (api_key_info or {}).get("_resolved_model", ""),
+                "resolved_model": (api_key_info.get("_resolved_model")
+                                   if isinstance(api_key_info, dict) else None) or model_name,
                 "stream": 1 if stream else 0,
                 "prompt_tokens": prompt_t,
                 "completion_tokens": completion_t,

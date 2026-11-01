@@ -1,25 +1,26 @@
-"""Bind /v1 requests to a single channel. Does not construct upstream HTTP clients."""
+"""Admit a model id, filter the account pool by it, walk the queue. No channel binding step."""
 
 from __future__ import annotations
 
 import copy
 import json
+import os
 from typing import Optional
 
 from fastapi import HTTPException
 
+import auth_manager
+import catalog
 import database as db
 import providers
 import responses
+import routing
 from reasoning_controls import normalize_chat_reasoning
 from model_capacity import clamp_output_tokens
 from providers.protocol import (
     BindResult,
-    InvalidModel,
-    KeyChannelMismatch,
     KNOWN_CHANNEL_SET,
     UnknownChannel,
-    UnknownModel,
 )
 
 ANY_CHANNEL = "*"
@@ -36,194 +37,270 @@ def _key_allows_any(key_channel: str) -> bool:
     return key_channel == ANY_CHANNEL
 
 
-def _channels_accepting(inner: str) -> list[str]:
-    matched = []
-    for channel in providers.enabled_provider_ids():
+def _normalize_channel_order(raw) -> list[str]:
+    """Configured channel order, with any unlisted enabled channel appended."""
+    known = providers.enabled_provider_ids()
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            raw = []
+    if not isinstance(raw, (list, tuple)):
+        raw = []
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in raw:
+        channel = str(item or "").strip()
+        if channel in known and channel not in seen:
+            seen.add(channel)
+            ordered.append(channel)
+    for channel in known:
+        if channel not in seen:
+            ordered.append(channel)
+    return ordered
+
+
+def _channel_order() -> list[str]:
+    """Channel precedence used for every tie-break in routing."""
+    try:
+        raw = db.get_setting("channel_order", [])
+    except Exception:
+        raw = []
+    return _normalize_channel_order(raw)
+
+
+def routable_channel_ids() -> list[str]:
+    """Enabled channels that can serve a request right now.
+
+    The client model catalog and the router share this single judgment: a
+    channel is advertised and tried exactly when ``routing.channel_pool`` has
+    something for it. That gate covers the active account *and* a quota that is
+    not provably used up, and it is deliberately fail-open — a channel whose
+    quota cannot be read stays routable, because a failed billing call must not
+    empty the pool.
+
+    A channel whose accounts are all out of quota is still routable when it has
+    at least one model marked 放行: that model skips the zero reading, so
+    calling the channel "未参与路由" would be wrong.
+    """
+    found: list[str] = []
+    for channel in _channel_order():
+        try:
+            pool = routing.channel_pool(channel)
+            if not pool and catalog.exempt_models(channel):
+                with routing.quota_exempt_scope({channel}):
+                    pool = routing.channel_pool(channel)
+            if pool:
+                found.append(channel)
+        except Exception:
+            continue
+    return found
+
+
+def _quota_exempt_channels(base: str) -> set[str]:
+    """Channels that serve `base` through a model marked 放行 in their catalog.
+
+    The mark lives on the channel's own catalog id, so the request id has to be
+    translated per channel first: "deepseek-v4.1-flash-1017" is
+    "DeepSeek-Flash" on qoder and "deepseek-v4.1-flash" on workbuddy.
+    """
+    if not base:
+        return set()
+    found: set[str] = set()
+    for channel in _channel_order():
         provider = providers.get_provider(channel)
-        if provider and provider.accepts_model(inner):
-            matched.append(channel)
+        if provider is None or not _channel_accepts(channel, base):
+            continue
+        try:
+            marks = set(catalog.exempt_models(channel))
+        except Exception:
+            marks = set()
+        if not marks:
+            continue
+        names = {base}
+        try:
+            names.add(provider.translate_model(base))
+        except Exception:
+            pass
+        if names & marks:
+            found.add(channel)
+    return found
+
+
+def _channels_for_name(name: str) -> list[str]:
+    """Every enabled channel whose catalog serves `name` exactly as written.
+
+    The client model id is the whole filter. A namespaced id ("qoder/auto")
+    belongs to that channel alone; a bare id stays in every channel that
+    recognizes it. The old binder is gone because the prefix never had to be
+    parsed into a routing decision — it *is* a catalog lookup the provider
+    already performs.
+    """
+    matched: list[str] = []
+    for channel in _channel_order():
+        provider = providers.get_provider(channel)
+        if provider is None:
+            continue
+        try:
+            if provider.accepts_model(name):
+                matched.append(channel)
+        except Exception:
+            continue
     return matched
 
 
-def _prefer_usable(candidates: list[str]) -> str:
-    """Choose the channel with the highest-priority active account.
+def _namespaced(name: str) -> tuple[str | None, str]:
+    """Split "channel/id" only when the leading part is a known channel id.
 
-    Used only when an any-channel key left the channel open. Quota exhaustion
-    does not count: an active account with no credits still keeps the channel.
-    If none of the candidates have an account, the first one remains so the
-    caller gets that channel's unavailable error instead of a later channel.
+    Returns (channel | None, base). A name with no known prefix comes back as
+    (None, name) and is then treated as a bare id.
     """
-    if not candidates:
-        raise UnknownChannel("")
-    ranked = []
-    for index, channel in enumerate(candidates):
-        try:
-            accounts = db.get_active_accounts(channel)
-            if accounts:
-                priority = max(int(account.get("priority") or 0) for account in accounts)
-                ranked.append((-priority, index, channel))
-        except Exception:
-            continue
-    return min(ranked)[2] if ranked else candidates[0]
-
-
-def _other_channel_ids(inner: str, except_channel: str) -> bool:
-    for channel in providers.enabled_provider_ids():
-        if channel == except_channel:
-            continue
-        provider = providers.get_provider(channel)
-        if provider and provider.accepts_model(inner):
-            return True
-    return False
-
-
-def bind(payload: dict, api_key_info: dict | None) -> BindResult:
-    original = payload.get("model", "auto")
-    if original is None or original == "":
-        original = "auto"
-    if not isinstance(original, str):
-        raise InvalidModel(str(original), "model must be a string")
-    original = original.strip() or "auto"
-    key_channel = _key_channel(api_key_info)
-
-    first, sep, rest = original.partition("/")
+    first, sep, rest = (name or "").partition("/")
     if sep and first in KNOWN_CHANNEL_SET:
-        channel = first
-        inner = rest
-        if not inner:
-            raise InvalidModel(original, f"model '{original}' is missing the inner id")
-        if providers.is_retired_channel(channel):
-            raise UnknownChannel(channel, providers.retired_message(channel))
-        if not providers.is_channel_enabled(channel) or providers.get_provider(channel) is None:
-            raise UnknownChannel(channel)
-        provider = providers.get_provider(channel)
-        if not provider.accepts_model(inner):
-            raise InvalidModel(original)
-        if not _key_allows_any(key_channel) and key_channel != channel:
-            raise KeyChannelMismatch(channel, key_channel)
-        return BindResult(channel=channel, inner=inner, original=original)
-
-    if _key_allows_any(key_channel):
-        if original == "auto":
-            channel = _prefer_usable(providers.enabled_provider_ids())
-        else:
-            matches = _channels_accepting(original)
-            if not matches:
-                raise UnknownModel(original)
-            channel = _prefer_usable(matches)
-        return BindResult(channel=channel, inner=original, original=original)
-
-    # Unprefixed: bind the key's own channel. A bare id from another channel
-    # stays a 400 instead of hopping over.
-    channel = key_channel
-    if providers.is_retired_channel(channel):
-        raise UnknownChannel(channel, providers.retired_message(channel))
-    if not providers.is_channel_enabled(channel) or providers.get_provider(channel) is None:
-        raise UnknownChannel(channel)
-    provider = providers.get_provider(channel)
-    inner = original
-    if inner == "auto" or provider.accepts_model(inner):
-        return BindResult(channel=channel, inner=inner, original=original)
-    if _other_channel_ids(inner, channel):
-        raise UnknownModel(
-            original,
-            f"Model '{original}' belongs to another channel; "
-            f"switch this API key's channel or send a namespaced id",
-        )
-    raise UnknownModel(original)
+        return first, rest
+    return None, name
 
 
-def bind_http(payload: dict, api_key_info: dict | None) -> BindResult:
-    try:
-        return bind(payload, api_key_info)
-    except UnknownChannel as exc:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": {
-                    "message": str(exc),
-                    "type": "unknown_channel",
-                    "code": "unknown_channel",
-                    "channel": exc.channel,
-                }
-            },
-        ) from exc
-    except KeyChannelMismatch as exc:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "error": {
-                    "message": str(exc),
-                    "type": "key_channel_mismatch",
-                    "code": "key_channel_mismatch",
-                    "channel": exc.channel,
-                    "key_channel": exc.key_channel,
-                }
-            },
-        ) from exc
-    except InvalidModel as exc:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": {
-                    "message": str(exc),
-                    "type": "invalid_model",
-                    "code": "invalid_model",
-                }
-            },
-        ) from exc
-    except UnknownModel as exc:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": {
-                    "message": str(exc),
-                    "type": "unknown_model",
-                    "code": "unknown_model",
-                }
-            },
-        ) from exc
-
-
-async def ensure_usable(channel: str) -> None:
-    if providers.is_retired_channel(channel):
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": {
-                    "message": providers.retired_message(channel),
-                    "type": "unknown_channel",
-                    "code": "channel_retired",
-                    "channel": channel,
-                }
-            },
-        )
+def _channel_accepts(channel: str, name: str) -> bool:
     provider = providers.get_provider(channel)
     if provider is None:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": {
-                    "message": f"Unknown or disabled channel '{channel}'",
-                    "type": "unknown_channel",
-                    "code": "unknown_channel",
-                    "channel": channel,
-                }
-            },
-        )
-    if await provider.has_usable_account():
-        return
-    raise HTTPException(
-        status_code=503,
-        detail={
-            "error": {
-                "message": f"No usable accounts for channel '{channel}'",
-                "type": "channel_unavailable",
-                "code": "channel_unavailable",
-                "channel": channel,
-            }
-        },
+        return False
+    try:
+        return bool(provider.accepts_model(name))
+    except Exception:
+        return False
+
+
+def _pinned_channel(api_key_info: dict | None) -> str | None:
+    """The one channel this key is pinned to, or None when it may use any.
+
+    ``_visible_channels`` returns the same thing as a list; this form is for
+    callers that need to report the channel's own state.
+    """
+    if not api_key_info:
+        return None
+    key_channel = _key_channel(api_key_info)
+    return None if _key_allows_any(key_channel) else key_channel
+
+
+def _visible_channels(api_key_info: dict | None) -> list[str]:
+    """Channels whose models this key may see; no binding means all of them.
+
+    A key bound to one channel only ever sees that channel's catalog. This is
+    the whole of the old per-channel binding, reduced to one filter. A falsy
+    ``api_key_info`` (unauthenticated deployments) carries no binding.
+    """
+    if not api_key_info:
+        return _channel_order()
+    key_channel = _key_channel(api_key_info)
+    if _key_allows_any(key_channel):
+        return _channel_order()
+    return [key_channel]
+
+
+def _bad_model(message: str, kind: str) -> HTTPException:
+    return HTTPException(
+        status_code=400,
+        detail={"error": {"message": message, "type": "invalid_request_error", "code": kind}},
     )
+
+
+def _name_variants(name: str, prefix: str | None, base: str, candidates: list[str]) -> set[str]:
+    """Every spelling a whitelist may have stored for this request.
+
+    A whitelist entry is a name a human typed into a box, so it may be the
+    bare id, the namespaced id, or some channel's translation of it. Match
+    all of them; rejecting because the operator stored the translation instead
+    of the alias is not a rule anyone can remember.
+    """
+    variants = {name, base}
+    if prefix is None and candidates:
+        variants.add(f"{candidates[0]}/{base}")
+    for channel in candidates:
+        provider = providers.get_provider(channel)
+        if provider is None:
+            continue
+        try:
+            translated = provider.translate_model(base)
+        except Exception:
+            continue
+        variants.add(translated)
+        variants.add(f"{channel}/{translated}")
+    return variants
+
+
+def admit_model(api_key_info: dict | None, name) -> str:
+    """One admission check, run before any account is touched.
+
+    The request either names a model this key can use — and we hand back the
+    bare id to filter the pool with — or it is rejected here with a 400.
+    Nothing downstream ever asks again: passing this gate is the proof that
+    some catalog owns the name and the key is allowed it.
+
+    Deliberately name-only. It does not care whether an account is alive,
+    cooling down, or out of quota; that is the queue's business, and a model
+    stays admitted even at 3 a.m. when every pool is empty.
+
+    Rejects with 400 when:
+      * the name is not a string, or a namespaced id with nothing after it;
+      * a namespaced id names a retired or disabled channel;
+      * no channel this key can see has the name in its catalog;
+      * the key carries an allowed_models whitelist and none of the name's
+        legal spellings is in it.
+    """
+    if name is None or name == "":
+        name = "auto"
+    if not isinstance(name, str):
+        raise _bad_model("model must be a string", "invalid_model")
+    name = name.strip() or "auto"
+
+    prefix, base = _namespaced(name)
+    visible = _visible_channels(api_key_info)
+
+    if prefix is not None:
+        # A retired or disabled channel is a name the operator deleted, not a
+        # name this key happens to lack: say which, even for a key bound
+        # elsewhere. The old binder checked the channel's own state first and
+        # that ordering is part of the error contract.
+        if providers.is_retired_channel(prefix):
+            raise _bad_model(providers.retired_message(prefix), "channel_retired")
+        if not providers.is_channel_enabled(prefix) or providers.get_provider(prefix) is None:
+            raise _bad_model(f"Unknown or disabled channel '{prefix}'", "unknown_channel")
+        if prefix not in visible:
+            raise _bad_model(
+                f"Model '{name}' is not available for this API key",
+                "model_not_allowed",
+            )
+        if not base:
+            raise _bad_model(f"model '{name}' is missing the inner id", "invalid_model")
+        if not _channel_accepts(prefix, base):
+            raise _bad_model(f"Unknown model '{name}'", "unknown_model")
+        candidates = [prefix]
+    else:
+        # A key pinned to a channel that has since retired (or been switched
+        # off) is a state the operator can act on, so name it instead of
+        # pretending the model does not exist. Keys are created against an
+        # enabled channel, so this is a legacy row — the old binder checked it
+        # here too.
+        pinned = _pinned_channel(api_key_info)
+        if pinned is not None:
+            if providers.is_retired_channel(pinned):
+                raise _bad_model(providers.retired_message(pinned), "channel_retired")
+            if not providers.is_channel_enabled(pinned) or providers.get_provider(pinned) is None:
+                raise _bad_model(f"Unknown or disabled channel '{pinned}'", "unknown_channel")
+        candidates = [c for c in _channels_for_name(name) if c in visible]
+
+    if not candidates:
+        raise _bad_model(f"Unknown model '{name}'", "unknown_model")
+
+    allowed = (api_key_info or {}).get("allowed_models")
+    if allowed:
+        if set(allowed).isdisjoint(_name_variants(name, prefix, base, candidates)):
+            raise _bad_model(
+                f"Model '{name}' not allowed for this API key",
+                "model_not_allowed",
+            )
+    return base
 
 
 def _estimate_text_tokens(text: str) -> int:
@@ -422,11 +499,232 @@ async def echo_original(result: tuple, original: str) -> tuple:
     return result
 
 
-async def chat_after_bind(
-    bound: BindResult, payload: dict, api_key_info: dict | None
+# When enabled, a request that fails on its bound channel (or on every account
+# inside it) keeps trying the other channels that can serve the same model,
+# ordered by that channel's best available account priority. This makes the
+# whole account pool — not just the accounts inside one channel — participate
+# in failover, which is what the priority/weight fields are for.
+
+
+def _cross_channel_failover_enabled() -> bool:
+    return os.environ.get(
+        "BUDDY_CROSS_CHANNEL_FAILOVER", "1"
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
+async def _stream_first_is_error(stream) -> tuple[bool, list, object]:
+    """Peek the first chunk.
+
+    Returns (is_error, [first_chunk], remaining_iterator). A channel that
+    exhausted all its accounts emits a `data: {"error": {...}}` event first;
+    a channel that started producing content never counts as an error.
+    """
+    ait = stream.__aiter__()
+    try:
+        first = await ait.__anext__()
+    except StopAsyncIteration:
+        return (True, [], ait)
+    text = first.decode("utf-8", errors="replace") if isinstance(first, (bytes, bytearray)) else str(first)
+    is_error = False
+    for line in text.splitlines():
+        raw = line.strip()
+        if not raw.startswith("data:"):
+            continue
+        data = raw[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            parsed = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict) and isinstance(parsed.get("error"), dict):
+            is_error = True
+            break
+    return (is_error, [first], ait)
+
+
+async def _replay(first: list, rest, account: dict | None = None) -> object:
+    """Replay the peeked chunk, then the live stream.
+
+    ``account`` keeps the pinned hop alive for the whole stream: provider
+    generators are lazy, so their account picking runs on the first
+    __anext__ — outside the ``with`` that dispatched them.
+    """
+    if account is None:
+        for chunk in first:
+            yield chunk
+        async for chunk in rest:
+            yield chunk
+        return
+    with auth_manager.pinned_account(account):
+        for chunk in first:
+            yield chunk
+        async for chunk in rest:
+            yield chunk
+
+
+def account_queue(name: str | None = None, api_key_info: dict | None = None
+                  ) -> list[tuple[str, dict]]:
+    """The routing queue: every account this request may spend, in order.
+
+    Exactly the operator's four steps, and nowhere else:
+
+      1. drop the accounts that cannot serve at all — disabled channel, account
+         that is not ``active``, account cooling down after a failure, quota
+         provably used up (``routing.channel_pool`` applies that gate; a model
+         marked 放行 on that channel is exempt from the quota half of it);
+      2. drop the accounts whose catalog does not serve this model id: a
+         namespaced id matches its own channel only, a bare id every channel
+         that recognizes it, and a key bound to one channel never leaves it;
+      3. order what is left: priority DESC -> channel order -> id, fixed (expiry
+         no longer orders anything — it is display-only, see
+         ``routing.urgency_days``);
+      4. hand the list to the dispatcher, which walks it one account at a time.
+
+    ``name=None`` keeps the whole pool (no model filter); the admin page ranks
+    exactly that list, so what it shows is literally the order a request would
+    walk. ``api_key_info`` narrows it to the channels the key may see.
+
+    The namespaced/bare split is re-derived here from the same one rule
+    ``admit_model`` used; the queue never asks the caller to pre-slice the name.
+    """
+    order = _channel_order()
+    rank = {channel: index for index, channel in enumerate(order)}
+    prefix, base = _namespaced(name) if name else (None, "")
+    exempt = _quota_exempt_channels(base) if name else set()
+    key_channel = _key_channel(api_key_info) if api_key_info else None
+    key_locked = (
+        None
+        if key_channel is None or _key_allows_any(key_channel)
+        else key_channel
+    )
+    rows: list[tuple[str, dict]] = []
+    with routing.quota_exempt_scope(exempt):
+        for channel in order:
+            if prefix is not None and channel != prefix:
+                continue
+            if key_locked is not None and channel != key_locked:
+                continue
+            if name and not _channel_accepts(channel, base):
+                continue
+            if providers.get_provider(channel) is None:
+                continue
+            for account in routing.channel_pool(channel):
+                aid = int(account.get("id") or 0)
+                if not aid or auth_manager.account_is_cooling_down(aid):
+                    continue
+                rows.append((channel, account))
+    if not rows:
+        return rows
+
+    def queue_key(row: tuple[str, dict]) -> tuple:
+        channel, account = row
+        return (
+            -routing.priority_of(account),
+            rank.get(channel, len(order)),
+            int(account.get("id") or 0),
+        )
+
+    rows.sort(key=queue_key)
+    return rows
+
+
+def _hop_label(hop: tuple[str, dict] | None) -> str:
+    if not hop:
+        return "—"
+    channel, account = hop
+    name = account.get("name") or account.get("nickname") or account.get("id")
+    return f"{channel}/{name}"
+
+
+def _no_account_error() -> tuple:
+    return ("error", (503, {
+        "error": {"message": "No enabled account can serve this model right now",
+                  "type": "channel_unavailable", "code": "channel_unavailable"}}))
+
+
+def _clean_name(name) -> str:
+    name = ("auto" if name is None or name == "" else str(name)).strip()
+    return name or "auto"
+
+
+async def chat_after_name(
+    name: str, payload: dict, api_key_info: dict | None, after_queue=None
 ) -> tuple:
-    result = await _chat_after_bind_no_echo(bound, payload, api_key_info)
-    return await echo_original(result, bound.original)
+    """Walk the queue for `name`, one account at a time, and return a result.
+
+    The caller must have run ``admit_model`` first — that gate is the only
+    place the name is judged. The queue is built here, once, and the walk
+    consumes exactly that list: no second sort anywhere in the request path.
+
+    ``after_queue`` is awaited once with the non-empty queue before the first
+    account is spent; the server passes the key's daily quota reservation
+    there, so a request that found no account at all is never counted.
+
+    With cross-channel failover off the first hop's channel owns the request
+    and the provider walks its own pool under ``account_attempt_limit``.
+    With it on every hop pins exactly one account from the queue — that is
+    the only walk that honors the global order.
+    """
+    name = _clean_name(name)
+    _, base = _namespaced(name)
+    # A provider picks its account lazily, inside the stream it returns, so the
+    # 放行 exemption has to outlive this function rather than sit in a ``with``.
+    routing.note_quota_exempt(_quota_exempt_channels(base))
+    queue = account_queue(name, api_key_info)
+    if not queue:
+        return _no_account_error()
+    if after_queue is not None:
+        await after_queue(queue)
+
+    if not _cross_channel_failover_enabled():
+        bound = BindResult(channel=queue[0][0], inner=base, original=name)
+        result = await _chat_after_bind_no_echo(bound, payload, api_key_info)
+        return await echo_original(result, name)
+
+    last_error = None
+    for channel, account in queue:
+        provider = providers.get_provider(channel)
+        if provider is None:
+            continue
+        # One hop, one account, no pseudo-log: the walk is visible as the real
+        # per-account rows the providers already write.
+        hop = _hop_label((channel, account))
+        sub = BindResult(channel=channel, inner=base, original=name)
+        try:
+            with auth_manager.pinned_account(account):
+                result = await _chat_after_bind_no_echo(sub, payload, api_key_info)
+        except Exception as exc:  # a broken hop must not end the walk
+            result = ("error", (502, {
+                "error": {"message": str(exc)[:200] or "dispatch failed",
+                          "type": "upstream_error", "code": "upstream_error",
+                          "channel": channel}}))
+        kind = result[0]
+        if kind == "json":
+            return await echo_original(result, name)
+        if kind == "error":
+            last_error = result
+            continue
+        if kind == "stream":
+            with auth_manager.pinned_account(account):
+                is_error, first, rest = await _stream_first_is_error(result[1])
+            if is_error:
+                last_error = ("error", (502, {
+                    "error": {"message": f"account '{hop}' failed",
+                              "type": "channel_unavailable", "code": "channel_unavailable",
+                              "channel": channel}}))
+                # Close out the abandoned stream.
+                try:
+                    with auth_manager.pinned_account(account):
+                        async for _ in rest:
+                            pass
+                except Exception:
+                    pass
+                continue
+            return ("stream", _rewrite_stream_model(_replay(first, rest, account), name))
+    if last_error is not None:
+        return last_error
+    return _no_account_error()
 
 
 async def _chat_after_bind_no_echo(
@@ -449,11 +747,31 @@ async def _chat_after_bind_no_echo(
     return await dispatch_with_context_policy(provider, bound.channel, dispatch, info)
 
 
-async def responses_after_bind(
-    bound: BindResult, payload: dict, api_key_info: dict | None
+async def responses_after_name(
+    name: str, payload: dict, api_key_info: dict | None, after_queue=None
 ) -> tuple:
-    """Bridge Responses through the provider selected by the existing bind."""
-    dispatch = dispatch_payload(payload, bound.inner)
+    """Bridge Responses through the first hop's channel — one pool, no queue walk.
+
+    The bridge redispatches the chat handler after a context trim, so it owns
+    one channel and lets that provider retry inside its own pool, exactly what
+    the old bound-channel bridge did; the cross-channel walk is the chat
+    endpoint's, not this one's. The queue is still consulted for the admission
+    contract: an empty queue is the same 503 as chat returns, and the daily
+    quota (``after_queue``) is only spent when an account exists to serve.
+    """
+    name = _clean_name(name)
+    _, base = _namespaced(name)
+    routing.note_quota_exempt(_quota_exempt_channels(base))
+    queue = account_queue(name, api_key_info)
+    if not queue:
+        return _no_account_error()
+    if after_queue is not None:
+        await after_queue(queue)
+    channel = queue[0][0]
+    if api_key_info and api_key_info.get("client_type") == "codex":
+        payload = trim_codex_prompt(payload, channel, base)
+    bound = BindResult(channel=channel, inner=base, original=name)
+    dispatch = dispatch_payload(payload, base)
 
     async def chat_handler(chat_payload: dict, _api_key_info: dict | None) -> tuple:
         return await _chat_after_bind_no_echo(bound, chat_payload, api_key_info)
@@ -463,4 +781,4 @@ async def responses_after_bind(
         api_key_info,
         chat_handler=chat_handler,
     )
-    return await echo_original(result, bound.original)
+    return await echo_original(result, name)

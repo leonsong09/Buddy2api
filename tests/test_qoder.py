@@ -1,13 +1,14 @@
 import asyncio
 import json
+import time
 
 import pytest
+from fastapi import HTTPException
 
 import credential_crypto
 import database as db
 import providers
 import router
-from providers.protocol import KeyChannelMismatch
 from providers.qoder.encode import encode_body
 from providers.qoder.constants import upstream_key
 from providers.qoder.checkin import claim_checkin, describe_campaigns, fetch_checkin
@@ -33,12 +34,17 @@ def test_qoder_regions_do_not_share_intl_only_models():
     assert not cn.accepts_model("Ultimate")
 
 
-def test_qoder_prefix_stays_on_its_own_key():
-    bound = router.bind({"model": "qoder-i/Ultimate"}, {"default_channel": "qoder-i"})
-    assert bound.channel == "qoder-i"
-    assert bound.inner == "Ultimate"
-    with pytest.raises(KeyChannelMismatch):
-        router.bind({"model": "qoder-i/Ultimate"}, {"default_channel": "qoder"})
+def test_qoder_prefix_stays_on_its_own_key(isolated_db):
+    db.add_account({"name": "cn", "uid": "cn", "provider": "qoder", "priority": 0})
+    db.add_account({"name": "intl", "uid": "intl", "provider": "qoder-i", "priority": 0})
+    key = {"default_channel": "qoder-i"}
+    assert router.admit_model(key, "qoder-i/Ultimate") == "Ultimate"
+    # The intl-only model is reached through the qoder-i channel and nowhere else.
+    assert [channel for channel, _row in router.account_queue("qoder-i/Ultimate", key)] == ["qoder-i"]
+    with pytest.raises(HTTPException) as err:
+        router.admit_model({"default_channel": "qoder"}, "qoder-i/Ultimate")
+    assert err.value.status_code == 400
+    assert err.value.detail["error"]["code"] == "model_not_allowed"
 
 
 def test_qoder_encode_reorders_and_replaces_padding():
@@ -338,6 +344,154 @@ def test_claim_posts_only_claimable_benefit(isolated_db, monkeypatch):
     assert posts[0][0].endswith("/sash/api/v1/me/campaigns/act-9/claim")
     assert posts[0][1] == {}
 
+
+def test_campaign_validity_days_are_parsed():
+    from providers.qoder.checkin import _benefit_valid_days
+
+    assert _benefit_valid_days({"benefit": {"amount": 100, "validity": {"days": 30}}}) == 30
+    assert _benefit_valid_days({"benefit": {"amount": 100, "validity": 7}}) == 7
+    assert _benefit_valid_days({"benefit": {"amount": 100}}) is None
+    assert _benefit_valid_days({"benefit": {"amount": 100, "validity": {"days": 0}}}) is None
+    assert _benefit_valid_days({}) is None
+
+    described = describe_campaigns(
+        {
+            "campaigns": [
+                {
+                    "actionType": "CLAIM_BENEFIT",
+                    "claimStatus": "CLAIMED",
+                    "campaignId": "act-1",
+                    "benefit": {"kind": "CREDITS", "amount": 100, "validity": {"days": 30}},
+                }
+            ]
+        }
+    )
+    assert described["state"] == "claimed"
+    assert described["valid_days"] == 30
+
+
+def test_claimed_campaign_caches_the_credits_deadline(isolated_db, monkeypatch):
+    import control_plane
+    import routing
+    from providers.qoder import checkin
+
+    account_id = db.add_account(
+        {
+            "name": "qoder",
+            "uid": "q-deadline",
+            "provider": "qoder",
+            "access_token": "dt-test",
+            "status": "active",
+        }
+    )
+    account = db.get_account(account_id)
+
+    class Listed:
+        status_code = 200
+
+        def json(self):
+            return {
+                "campaigns": [
+                    {
+                        "actionType": "CLAIM_BENEFIT",
+                        "claimStatus": "CLAIMED",
+                        "campaignId": "act-1",
+                        "benefit": {"kind": "CREDITS", "amount": 100, "validity": {"days": 30}},
+                    }
+                ]
+            }
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, headers=None):
+            return Listed()
+
+    monkeypatch.setattr(checkin.httpx, "AsyncClient", FakeClient)
+
+    result = asyncio.run(control_plane.checkin_status_one(account, force=True))
+    assert result["already_claimed"] is True
+    assert result["expire_source"] == checkin.CAMPAIGN_EXPIRE_SOURCE
+    assert time.time() + 30 * 86400 - 60 <= float(result["next_expire_ts"]) <= time.time() + 30 * 86400 + 60
+
+    fresh = db.get_account(account_id)
+    snapshot = routing.resource_snapshot(fresh)
+    assert snapshot["next_expire_days"] == 30
+    assert snapshot["expires_at"] == snapshot["next_expire_ts"]
+    assert routing.urgency_source(fresh, "qoder") == "quota"
+    assert routing.urgency_days(fresh, "qoder") == 30.0
+
+
+def test_claim_caches_the_not_granted_validity(isolated_db, monkeypatch):
+    import control_plane
+    import routing
+    from providers.qoder import checkin
+
+    account_id = db.add_account(
+        {
+            "name": "qoder",
+            "uid": "q-claim-deadline",
+            "provider": "qoder",
+            "access_token": "dt-test",
+            "status": "active",
+        }
+    )
+    account = db.get_account(account_id)
+
+    class Listed:
+        status_code = 200
+
+        def json(self):
+            return {
+                "campaigns": [
+                    {
+                        "actionType": "CLAIM_BENEFIT",
+                        "claimStatus": "CLAIMABLE",
+                        "campaignId": "act-9",
+                        "benefit": {"amount": 100},
+                    }
+                ]
+            }
+
+    class Granted:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"status": "CLAIMED", "benefit": {"amount": 100, "validity": {"days": 15}}}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, headers=None):
+            return Listed()
+
+        async def post(self, url, headers=None, json=None):
+            return Granted()
+
+    monkeypatch.setattr(checkin.httpx, "AsyncClient", FakeClient)
+
+    result = asyncio.run(control_plane.claim_one(account))
+    assert result["claimed"] is True
+    assert "next_expire_ts" in result
+
+    snapshot = routing.resource_snapshot(db.get_account(account_id))
+    assert snapshot["next_expire_days"] == 15
+    assert routing.urgency_days(db.get_account(account_id), "qoder") == 15.0
 
 @pytest.mark.parametrize("stream", [False, True])
 def test_qoder_failover_reaches_fifth_account(isolated_db, monkeypatch, stream):

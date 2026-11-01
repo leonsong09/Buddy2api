@@ -4,12 +4,12 @@ import time
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 
 import credential_crypto
 import database as db
 import providers
 import router
-from providers.protocol import UnknownChannel, UnknownModel
 from providers.qwenwork import cosy
 from providers.qwenwork.chat import (
     build_body,
@@ -133,19 +133,21 @@ def test_qwenwork_quota_remaining_nested():
 
 
 def test_bind_qwenwork_when_enabled(qwen_enabled):
-    bound = router.bind({"model": "auto"}, {"default_channel": "qwenwork"})
-    assert bound.channel == "qwenwork"
-    assert bound.inner == "auto"
-    bound = router.bind({"model": "qwenwork/qwork-advanced"}, {"default_channel": "qwenwork"})
-    assert bound.inner == "qwork-advanced"
-    with pytest.raises(UnknownModel):
-        router.bind({"model": "glm-5.2"}, {"default_channel": "qwenwork"})
+    key = {"default_channel": "qwenwork"}
+    assert router.admit_model(key, "auto") == "auto"
+    assert router.admit_model(key, "qwenwork/qwork-advanced") == "qwork-advanced"
+    with pytest.raises(HTTPException) as err:
+        router.admit_model(key, "glm-5.2")
+    assert err.value.status_code == 400
+    assert err.value.detail["error"]["code"] == "unknown_model"
 
 
 def test_bind_qwenwork_disabled_is_unknown_channel(monkeypatch):
     monkeypatch.setenv("CB_GATEWAY_PROVIDERS", "workbuddy")
-    with pytest.raises(UnknownChannel):
-        router.bind({"model": "qwenwork/qwork-advanced"}, {"default_channel": "qwenwork"})
+    with pytest.raises(HTTPException) as err:
+        router.admit_model({"default_channel": "qwenwork"}, "qwenwork/qwork-advanced")
+    assert err.value.status_code == 400
+    assert err.value.detail["error"]["code"] == "unknown_channel"
 
 
 def test_qwenwork_sources_do_not_touch_workbuddy_stack():
@@ -649,3 +651,187 @@ def test_provider_checkin_is_enabled():
     assert PROVIDER.checkin_supported is True
     assert hasattr(PROVIDER, "claim_checkin")
     assert hasattr(PROVIDER, "fetch_checkin")
+
+
+def test_wallet_expiry_skips_spent_and_past_wallets():
+    from datetime import datetime, timedelta
+
+    from providers.qwenwork import checkin
+
+    now = datetime(2026, 11, 1, 12, 0, tzinfo=checkin.SHANGHAI)
+    soon = (now + timedelta(days=3)).isoformat()
+    later = (now + timedelta(days=40)).isoformat()
+    past = (now - timedelta(days=1)).isoformat()
+    payload = {
+        "data": {
+            "active_wallets": {
+                "wallets": [
+                    {"balance": 0, "valid_to": soon},
+                    {"balance": 500, "valid_to": past},
+                    {"balance": 2000, "valid_to": later},
+                    {"balance": 99.5, "valid_to": soon},
+                    {"balance": 10},
+                ]
+            }
+        }
+    }
+    assert checkin.wallet_expiry(payload, now=now) == datetime.fromisoformat(soon).timestamp()
+    assert checkin.wallet_expiry({"data": {"active_wallets": {"wallets": []}}}, now=now) is None
+    assert checkin.wallet_expiry({}, now=now) is None
+
+
+def test_status_checkin_caches_the_wallet_deadline(isolated_db, qwen_enabled, monkeypatch):
+    import control_plane
+    import routing
+    from datetime import datetime, timedelta
+
+    from providers.qwenwork import checkin
+
+    account_id = db.add_account(
+        {
+            "name": "qw",
+            "uid": "qw-deadline",
+            "provider": "qwenwork",
+            "access_token": "device-token",
+            "expires_at": 9_999_999_999_999,
+        }
+    )
+    account = db.get_account(account_id)
+    expiry = datetime.now(checkin.SHANGHAI) + timedelta(days=30)
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"data": {"active_wallets": {"wallets": [{"balance": 2000, "valid_to": expiry.isoformat()}]}}}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(checkin.httpx, "AsyncClient", FakeClient)
+
+    result = asyncio.run(control_plane.checkin_status_one(account, force=True))
+    # The daily bucket is missing, but the long-lived pack still has a deadline.
+    assert result["no_campaign"] is True
+    assert result["expire_source"] == checkin.WALLET_EXPIRE_SOURCE
+    assert abs(float(result["next_expire_ts"]) - expiry.timestamp()) < 1
+
+    fresh = db.get_account(account_id)
+    snapshot = routing.resource_snapshot(fresh)
+    assert snapshot["next_expire_ts"] == snapshot["expires_at"]
+    assert abs(float(snapshot["next_expire_ts"]) - expiry.timestamp()) < 1
+    assert snapshot["next_expire_days"] == 30
+    # A wallet balance is a daily bucket, not the account total: never cached as
+    # remaining, or routing would drop the account as exhausted.
+    assert "remaining" not in snapshot
+    assert routing.urgency_source(fresh, "qwenwork") == "quota"
+    assert routing.urgency_days(fresh, "qwenwork") == 30.0
+    assert routing.quota_exhausted(fresh) is False
+
+
+def test_status_checkin_without_a_deadline_writes_nothing(isolated_db, qwen_enabled, monkeypatch):
+    import control_plane
+    import routing
+    from providers.qwenwork import checkin
+
+    account_id = db.add_account(
+        {
+            "name": "qw",
+            "uid": "qw-no-deadline",
+            "provider": "qwenwork",
+            "access_token": "device-token",
+            "expires_at": 9_999_999_999_999,
+        }
+    )
+    account = db.get_account(account_id)
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            # Spent daily bucket: no valid_to worth routing on.
+            return {"data": {"active_wallets": {"wallets": [{"balance": 0}]}}}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(checkin.httpx, "AsyncClient", FakeClient)
+
+    result = asyncio.run(control_plane.checkin_status_one(account, force=True))
+    assert "next_expire_ts" not in result
+    assert routing.resource_snapshot(db.get_account(account_id)) == {}
+    assert routing.urgency_source(db.get_account(account_id), "qwenwork") == "default"
+    assert routing.urgency_days(db.get_account(account_id), "qwenwork") == routing.DEFAULT_URGENCY_DAYS
+
+
+def test_resource_cache_takes_remaining_without_inventing_an_expiry(isolated_db):
+    import resource_sync
+    import routing
+
+    account_id = db.add_account({"name": "x", "uid": "x-1", "provider": "xiaohuanxiong", "status": "active"})
+    account = db.get_account(account_id)
+
+    stored = resource_sync.store_quota_expiry(account, remaining=500, source="test")
+    assert stored["remaining"] == 500
+    assert stored["available_total"] == 500
+    assert "next_expire_ts" not in stored
+    assert "expires_at" not in stored
+    assert "next_expire_days" not in stored
+
+    snapshot = routing.resource_snapshot(account)
+    assert snapshot["remaining"] == 500
+    assert "next_expire_ts" not in snapshot
+    assert routing.urgency_source(account, "xiaohuanxiong") == "default"
+    assert routing.urgency_days(account, "xiaohuanxiong") == routing.DEFAULT_URGENCY_DAYS
+    assert routing.quota_exhausted(account) is False
+
+    # A deadline that already passed is not a deadline: keep the older reading.
+    assert resource_sync.store_quota_expiry(account, expires_at=time.time() - 60) == {}
+    assert routing.resource_snapshot(account)["remaining"] == 500
+    assert resource_sync.store_quota_expiry(account) == {}
+    assert routing.resource_snapshot(account)["remaining"] == 500
+
+
+def test_daily_bucket_keeps_the_fraction_of_a_day(isolated_db):
+    import resource_sync
+    import routing
+    from providers.qwenwork import checkin
+
+    # The daily bucket expires at the next Shanghai midnight, so the cached
+    # deadline must carry the fraction of a day: flattening it to whole days
+    # would report "expires now" for most of the afternoon.
+    midnight = checkin._next_shanghai_midnight()
+    account_id = db.add_account({"name": "qw", "uid": "qw-daily", "provider": "qwenwork", "status": "active"})
+    fresh = db.get_account(account_id)
+    stored = resource_sync.store_quota_expiry(fresh, expires_at=midnight.timestamp(), source=checkin.WALLET_EXPIRE_SOURCE)
+
+    days = stored["next_expire_days"]
+    assert isinstance(days, float)
+    assert 0 < days <= 1
+    assert abs(days - (midnight.timestamp() - time.time()) / 86400) < 0.01
+
+    snapshot = routing.resource_snapshot(fresh)
+    assert snapshot["next_expire_days"] == days
+    assert 0 < routing.urgency_days(fresh, "qwenwork") <= 1
+    assert routing.urgency_days(fresh, "qwenwork") == days
+    assert routing.urgency_source(fresh, "qwenwork") == "quota"

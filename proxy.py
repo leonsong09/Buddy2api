@@ -40,6 +40,15 @@ FAILURE_CLASSES = {
     FAILURE_PARSE_ERROR,
 }
 
+# 单个请求在「同一通道」内最多尝试多少个不同账号（failover）。
+# 0（默认）= 试遍该通道所有可用账号；设正整数则封顶，避免上游系统性故障时
+# 把所有账号都打进冷却、延迟爆炸。终端错误（如 11-128/400）仍第一次就返回，不浪费号。
+MAX_ACCOUNT_FAILOVER = int(os.environ.get("BUDDY_MAX_ACCOUNT_FAILOVER", "0") or 0)
+
+
+def _failover_cap() -> int:
+    return MAX_ACCOUNT_FAILOVER if MAX_ACCOUNT_FAILOVER > 0 else 1_000_000
+
 # 腾讯内容审核拦截时返回的固定话术特征（HTTP 200 + 正文是这段话）。
 # 仅匹配短拒答，避免正常回答引用审查文案时被误标。
 _AUDIT_PHRASE_GROUPS = (
@@ -320,6 +329,93 @@ def _fallback_system_prompt() -> str:
     return "" if value.lower() in _SYSTEM_PROMPT_DISABLED else value
 
 
+# 上游 11128 只扫描 system 角色里的竞品 CLI 指纹（Claude Code / DeepSeek Harness /
+# Anthropic 等）。把客户端真实 system 指令搬到第一条 user 前面（包进
+# <client_instructions>），system 只保留一句无指纹的兜底，即可绕过渠道特征检测，
+# 且对任意未来出现的竞品名都免疫（无需维护词表）。来源参考：wnddd839/buddy-proxy。
+_CANONICAL_UPSTREAM_SYSTEM = "You are a helpful coding assistant."
+
+
+def _content_to_text(content):
+    """字符串原样返回；结构化 content 压成纯文本；其余 fmt 成字符串。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                if part.get("type") == "text" and isinstance(part.get("text"), str):
+                    parts.append(part["text"])
+            elif isinstance(part, str):
+                parts.append(part)
+        if len(parts) == len(content):
+            return "\n".join(parts)
+        # 含非文本块（图片等）时无法安全折叠，返回原始 content 让调用方决定
+        return content
+    return "" if content is None else str(content)
+
+
+def _fold_client_instructions_into_user(messages, instructions):
+    """把客户端指令（instructions，纯文本）塞进第一条 user 消息前面。
+
+    返回新的 messages 列表。若没有任何 user 消息，则在最前面补一条纯 user。
+    instructions 为空时原样返回 messages。
+    """
+    if not instructions:
+        return messages
+    wrapped = "<client_instructions>\n" + instructions.strip() + "\n</client_instructions>"
+    for i, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            messages[i] = {**message, "content": wrapped + "\n\n" + content}
+            return messages
+        if isinstance(content, list):
+            messages[i] = {**message, "content": [{"type": "text", "text": wrapped}, *content]}
+            return messages
+        # 非字符串/列表的 user content（极少见）跳过这一条继续找
+    return [{"role": "user", "content": wrapped}, *messages]
+
+
+def _relocate_system_fingerprints(messages):
+    """将 system 角色里的客户端指令搬到 user，system 只留无指纹兜底句。
+
+    - 收集所有 system 文本（去空白后非空）拼成 instructions。
+    - system 角色统一替换为一句无指纹的 _CANONICAL_UPSTREAM_SYSTEM。
+    - instructions 折叠进第一条 user（_fold_client_instructions_into_user）。
+    - 若原本就没有 system，则不动（保留 _ensure_leading_system_message 的兜底逻辑）。
+    """
+    if not isinstance(messages, list) or not messages:
+        return messages
+    had_system = any(
+        isinstance(m, dict) and m.get("role") == "system" for m in messages
+    )
+    if not had_system:
+        return messages
+    pieces = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") != "system":
+            continue
+        text = _content_to_text(message.get("content"))
+        if isinstance(text, str):
+            text = text.strip()
+            if text and text != "<nil>":
+                pieces.append(text)
+    instructions = "\n\n".join(pieces)
+    out = []
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "system":
+            continue
+        out.append(message)
+    out = _fold_client_instructions_into_user(out, instructions)
+    return [{"role": "system", "content": _CANONICAL_UPSTREAM_SYSTEM}, *out]
+
+
 def _ensure_leading_system_message(messages):
     if not isinstance(messages, list) or not messages:
         return messages
@@ -346,7 +442,10 @@ def build_backend_body(payload: dict) -> dict:
             else message
             for message in messages
         ]
-        # 角色归一化之后再补 system，避免 developer 被映射成 system 时重复插入
+        # 角色归一化之后，先把客户端 system 里的指纹指令搬到 user（仅当客户端
+        # 自带 system 时才动；若客户端没给 system，这里不动，留给下面的兜底补）
+        body["messages"] = _relocate_system_fingerprints(body["messages"])
+        # 再补兜底 system，避免 developer 被映射成 system 时重复插入
         body["messages"] = _ensure_leading_system_message(body["messages"])
     # Resolve model alias before forwarding
     raw_model = body.get("model", "auto")
@@ -793,7 +892,7 @@ class _SSEEventDecoder:
 def _log_request(api_key_info, account, model_name, stream,
                   prompt_t, completion_t, total_t, credit,
                   finish_reason, status_code, error_msg, t0,
-                  increment_usage: bool = True):
+                  increment_usage: bool = True, backend_model: Optional[str] = None):
     elapsed_ms = int((time.time() - t0) * 1000)
     log_data = {
         "api_key_id": api_key_info["id"] if api_key_info else None,
@@ -804,7 +903,11 @@ def _log_request(api_key_info, account, model_name, stream,
         or (api_key_info.get("_bind_channel") if api_key_info else None)
         or "workbuddy",
         "model": model_name,
-        "resolved_model": (api_key_info or {}).get("_resolved_model", ""),
+        "resolved_model": (
+            backend_model
+            or (api_key_info.get("_resolved_model") if isinstance(api_key_info, dict) else None)
+            or model_name
+        ),
         "stream": 1 if stream else 0,
         "prompt_tokens": prompt_t,
         "completion_tokens": completion_t,
@@ -873,18 +976,24 @@ async def _json_chat_with_stall_retry(
     provider: str = "workbuddy",
 ) -> tuple:
     tried_ids: set[int] = set()
-    max_retries = auth_manager.account_attempt_limit(provider)
     last_error = None
 
-    for attempt in range(max_retries):
+    attempt = 0
+    while attempt < _failover_cap():
         account = await auth_manager.pick_account_with_fallback(tried_ids, provider=provider)
         if not account:
+            break
+        if account["id"] in tried_ids:
+            # The picker is supposed to honour `tried_ids`; if it hands back an
+            # account we already burned, there is nothing left to try and
+            # retrying it would spin until the failover cap.
             break
 
         tried_ids.add(account["id"])
         headers = await auth_manager.get_valid_headers(account)
         if not headers:
             auth_manager.mark_account_failure(account["id"], 401)
+            attempt += 1
             continue
 
         url = f"{auth_manager.backend_url(account)}/v2/chat/completions"
@@ -926,7 +1035,7 @@ async def _json_chat_with_stall_retry(
             if isinstance(client_detail, dict):
                 error_data = client_detail.get("error") if isinstance(client_detail.get("error"), dict) else client_detail
                 error_message = error_data.get("message", client_detail) if isinstance(error_data, dict) else client_detail
-            will_retry = action != "stop" and attempt < max_retries - 1
+            will_retry = action != "stop" and attempt < _failover_cap() - 1
             _log_request(
                 api_key_info, account, model_name, False,
                 0, 0, 0, 0, "retry" if will_retry else failure,
@@ -936,9 +1045,10 @@ async def _json_chat_with_stall_retry(
             if not will_retry:
                 return last_error
             await _retry_delay(attempt)
+            attempt += 1
             continue
         auth_manager.mark_account_failure(account["id"], err_status)
-        will_retry = _is_retryable_status(err_status) and attempt < max_retries - 1
+        will_retry = _is_retryable_status(err_status) and attempt < _failover_cap() - 1
         error_message = detail
         if isinstance(detail, dict):
             error_data = detail.get("error") if isinstance(detail.get("error"), dict) else detail
@@ -953,6 +1063,7 @@ async def _json_chat_with_stall_retry(
         if not will_retry:
             return result
         await _retry_delay(attempt)
+        attempt += 1
 
     return last_error or (
         "error",
@@ -1076,10 +1187,14 @@ async def _stream_upstream(
     last_started = time.time()
     pending_retry_log: dict | None = None
 
-    max_attempts = auth_manager.account_attempt_limit(provider)
-    for attempt in range(max_attempts):
+    attempt = 0
+    while attempt < _failover_cap():
         account = await auth_manager.pick_account_with_fallback(tried_ids, provider=provider)
         if not account:
+            break
+        if account["id"] in tried_ids:
+            # See the note in the non-stream loop: never burn the cap re-trying an
+            # account the picker should have excluded.
             break
         if pending_retry_log is not None:
             _log_request(
@@ -1107,6 +1222,7 @@ async def _stream_upstream(
             last_error = b"Account credentials are invalid"
             last_error_event = None
             last_status = 401
+            attempt += 1
             continue
 
         url = f"{auth_manager.backend_url(account)}/v2/chat/completions"
@@ -1144,7 +1260,7 @@ async def _stream_upstream(
                             last_error_event = client_detail if isinstance(client_detail, dict) else None
                             last_status = client_status
                             last_failure = ruled_failure
-                            if action == "stop" or attempt >= max_attempts - 1:
+                            if action == "stop" or attempt >= _failover_cap() - 1:
                                 _log_request(
                                     api_key_info, account, model_name, True,
                                     0, 0, 0, 0, ruled_failure, client_status,
@@ -1168,13 +1284,14 @@ async def _stream_upstream(
                                 "started": t0,
                                 "attempt": attempt,
                             }
+                            attempt += 1
                             continue
                         last_error = http_msg.encode("utf-8")
                         last_error_event = None
                         last_status = response.status_code
                         last_failure = failure
                         auth_manager.mark_account_failure(account["id"], response.status_code)
-                        if _is_retryable_status(response.status_code) and attempt < max_attempts - 1:
+                        if _is_retryable_status(response.status_code) and attempt < _failover_cap() - 1:
                             pending_retry_log = {
                                 "account": account,
                                 "prompt_tokens": 0,
@@ -1187,6 +1304,7 @@ async def _stream_upstream(
                                 "started": t0,
                                 "attempt": attempt,
                             }
+                            attempt += 1
                             continue
                         _log_request(
                             api_key_info, account, model_name, True,
@@ -1234,7 +1352,7 @@ async def _stream_upstream(
             last_status = 502
             last_failure = failure
             auth_manager.mark_account_failure(account["id"], 502)
-            if not output_started and attempt < max_attempts - 1:
+            if not output_started and attempt < _failover_cap() - 1:
                 pending_retry_log = {
                     "account": account,
                     "prompt_tokens": 0,
@@ -1247,6 +1365,7 @@ async def _stream_upstream(
                     "started": t0,
                     "attempt": attempt,
                 }
+                attempt += 1
                 continue
             _log_request(
                 api_key_info, account, model_name, True,
@@ -1285,7 +1404,7 @@ async def _stream_upstream(
             last_status = 502
             last_failure = failure
             auth_manager.mark_account_failure(account["id"], 502)
-            if not output_started and attempt < max_attempts - 1:
+            if not output_started and attempt < _failover_cap() - 1:
                 pending_retry_log = {
                     "account": account,
                     "prompt_tokens": observer.usage.get("prompt_tokens", 0),
@@ -1298,6 +1417,7 @@ async def _stream_upstream(
                     "started": t0,
                     "attempt": attempt,
                 }
+                attempt += 1
                 continue
             _log_request(
                 api_key_info, account, model_name, True,

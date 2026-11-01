@@ -184,9 +184,11 @@ python server.py
 - 端口 8787 被占用：关掉旧的 Buddy2api，或 `python server.py --port 8788`。
 - 网页里一个账号都没有：还没导入。选对通道再检测；登录目录不对就设 `CB_AUTH_DIR` / `CB_QCLAW_AUTH_DIR` / `CB_QWENWORK_AUTH_DIR`。
 - 创建 Key 失败：没选通道。
-- 客户端 503 `channel_unavailable`：这个 Key 绑定的通道还没有可用账号。
-- 客户端 403 `key_channel_mismatch`：模型带了别的通道前缀，和当前 Key 不一致。
-- 客户端 400 `unknown_model`：模型不属于这把 Key 的通道。换 Key，或改成该通道认识的 id。
+- 客户端 503 `channel_unavailable`：这个模型当前一个可用账号都没有（账号全在冷却、过期或额度耗尽）。这个请求不计入 Key 的日限额。
+- 客户端 400 `model_not_allowed`：模型不在这把 Key 的可访问范围内（白名单里没有它，或名字带的通道和 Key 不一致）。
+- 客户端 400 `unknown_model`：这个名字没有任何通道的模型表认识它。
+- 客户端 400 `channel_retired`：名字里带的通道已下线（如 `qclaw/x`）。
+- 请求的模型 id 一律以 `/v1/models` 列出的为准：带通道前缀的 id（形如 `qoder/DeepSeek-Flash`）只在该通道里找账号，裸 id 则进入所有认识它的通道的账号池，按 优先级 → 通道顺序 逐号尝试，全部失败才返回错误。顺序是固定的（判定开关已删除）：额度归零的账号直接不参与排序，优先级相同再看通道顺序，最后按账号 id。账号的「即将到期」只作展示——哪个号快到期一眼能看出来，要优先用就把它优先级调高。
 
 ## 从 1.4.x 升级
 

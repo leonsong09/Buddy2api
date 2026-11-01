@@ -102,32 +102,75 @@ def test_deepseek_harness_identity_is_rewritten(monkeypatch):
     monkeypatch.setattr(proxy, "resolve_model_alias", lambda value: value)
     text = "You are an AI agent powered by DeepSeek Harness.\n\nKeep the task unchanged."
     changed = _body([{"role": "system", "content": text}])
-    content = changed["messages"][0]["content"]
-    assert "powered by DeepSeek's Harness." in content
-    assert "DeepSeek Harness." not in content
-    assert "Keep the task unchanged." in content
 
+    # The client's system identity fingerprint is sanitized (DeepSeek Harness ->
+    # "the AI assistant") and then relocated out of the system role into the first
+    # user message (<client_instructions>), because upstream's 11128 channel check
+    # only scans the system role. Exactly one canonical upstream system remains.
+    systems = [message for message in changed["messages"] if message["role"] == "system"]
+    assert len(systems) == 1
+    assert systems[0]["content"] == proxy._CANONICAL_UPSTREAM_SYSTEM
+
+    user = next(message for message in changed["messages"] if message["role"] == "user")
+    assert isinstance(user["content"], str)
+    assert "the AI assistant" in user["content"]
+    assert "DeepSeek Harness" not in user["content"]
+    assert "Keep the task unchanged." in user["content"]
+    assert "client_instructions" in user["content"]
+
+    # A plain mention of the DeepSeek Harness model is harmless upstream and must
+    # be left untouched (it lives in a user message and is not an identity string).
     mention = _body([{"role": "user", "content": "compare DeepSeek Harness with Codex"}])
     user = next(item for item in mention["messages"] if item["role"] == "user")
     assert user["content"] == "compare DeepSeek Harness with Codex"
+
+    # Case/period variants that the upstream 11128 check also rejects must all be
+    # neutralized (this project's own identity string is a high-weight fingerprint).
+    for variant in (
+        "You are an AI Agent powered by DeepSeek Harness.",
+        "You are an AI agent powered by DeepSeek Harness",
+        "You are DeepSeek Harness, an AI assistant.",
+        "powered by DeepSeek Harness now",
+    ):
+        cleaned = _body([{"role": "system", "content": variant}])
+        joined = "".join(
+            message["content"] if isinstance(message["content"], str) else ""
+            for message in cleaned["messages"]
+        )
+        assert "DeepSeek Harness" not in joined, variant
 
     parts = _body([{
         "role": "system",
         "content": [{"type": "text", "text": text}],
     }])
-    assert "DeepSeek's Harness." in parts["messages"][0]["content"][0]["text"]
+    user = next(message for message in parts["messages"] if message["role"] == "user")
+    first = user["content"][0] if isinstance(user["content"], list) else {"text": user["content"]}
+    assert "the AI assistant" in first["text"]
+    assert "DeepSeek Harness" not in first["text"]
 
 
 def test_fingerprint_rewrite_can_be_disabled(monkeypatch):
     monkeypatch.setattr(proxy, "resolve_model_alias", lambda value: value)
     text = "You are Claude Code, Anthropic's official CLI for Claude."
     changed = _body([{"role": "system", "content": text}])
-    assert "CLI tool for Claude" in changed["messages"][0]["content"]
+    # The Claude/Anthropic fingerprint is removed and the remaining client
+    # instructions are relocated into the user message; the system role holds only
+    # the canonical upstream prompt so upstream's 11128 channel check can't fire.
+    systems = [message for message in changed["messages"] if message["role"] == "system"]
+    assert len(systems) == 1
+    assert systems[0]["content"] == proxy._CANONICAL_UPSTREAM_SYSTEM
+    user = next(message for message in changed["messages"] if message["role"] == "user")
+    assert "You are an AI coding assistant" in user["content"]
+    assert "Anthropic" not in "".join(
+        message["content"] if isinstance(message["content"], str) else ""
+        for message in changed["messages"]
+    )
     assert "11128" not in _body([{"role": "user", "content": "code 11128"}])["messages"][0]["content"]
 
     monkeypatch.setenv("CB_GATEWAY_SANITIZE_FINGERPRINTS", "off")
     kept = _body([{"role": "system", "content": text}])
-    assert kept["messages"][0]["content"] == text
+    user = next(message for message in kept["messages"] if message["role"] == "user")
+    assert text in user["content"]
 
 
 def test_terminal_code_does_not_penalize_or_rotate(monkeypatch):

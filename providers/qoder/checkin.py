@@ -7,6 +7,8 @@ International daily credits are listed only when the device risk headers are set
 
 from __future__ import annotations
 
+import time
+
 import httpx
 
 import database as db
@@ -18,6 +20,8 @@ from providers.qoder.constants import (
     region,
 )
 from providers.qoder.token import QoderAuthError, refresh_account
+
+CAMPAIGN_EXPIRE_SOURCE = "qoder-campaign-validity"
 
 
 def _headers(account: dict) -> dict[str, str]:
@@ -72,6 +76,25 @@ def _benefit_amount(row: dict) -> float:
     return _amount(benefit.get("amount"))
 
 
+def _benefit_valid_days(row: dict) -> float | None:
+    """How long the granted credits last, in days.
+
+    The campaign row states it as ``benefit.validity.days``; some payloads send
+    the number itself instead of the wrapper, so both shapes are accepted. No
+    duration means the credits do not expire on a known date.
+    """
+    benefit = row.get("benefit") if isinstance(row.get("benefit"), dict) else {}
+    validity = benefit.get("validity")
+    days = _amount(validity.get("days")) if isinstance(validity, dict) else _amount(validity)
+    return days if days > 0 else None
+
+
+def _expiry_after_days(days) -> float | None:
+    if not days or days <= 0:
+        return None
+    return time.time() + float(days) * 86400.0
+
+
 def _credit_text(amount: float) -> str:
     if amount <= 0:
         return ""
@@ -89,8 +112,10 @@ def _result(
     already_claimed: bool = False,
     no_campaign: bool = False,
     credit: float = 0,
+    next_expire_ts: float | None = None,
+    expire_source: str = "",
 ) -> dict:
-    return {
+    row = {
         "account_id": account.get("id"),
         "account_name": account.get("nickname") or account.get("name") or str(account.get("id") or ""),
         "ok": ok,
@@ -103,6 +128,11 @@ def _result(
         "credit": credit,
         "channel": account.get("provider") or "qoder",
     }
+    if next_expire_ts:
+        # Callers persist this; the row keeps its old shape when nothing is known.
+        row["next_expire_ts"] = next_expire_ts
+        row["expire_source"] = expire_source
+    return row
 
 
 def describe_campaigns(payload) -> dict:
@@ -116,6 +146,7 @@ def describe_campaigns(payload) -> dict:
             "state": "claimable",
             "campaign_id": str(claimable.get("campaignId") or claimable.get("id") or ""),
             "credit": credit,
+            "valid_days": _benefit_valid_days(claimable),
             "message": "可领取" + _credit_text(credit),
         }
     if claimed is not None:
@@ -124,12 +155,14 @@ def describe_campaigns(payload) -> dict:
             "state": "claimed",
             "campaign_id": "",
             "credit": credit,
+            "valid_days": _benefit_valid_days(claimed),
             "message": "今日已领取" + _credit_text(credit),
         }
     return {
         "state": "none",
         "campaign_id": "",
         "credit": 0,
+        "valid_days": None,
         "message": "当前没有可领取的签到活动",
     }
 
@@ -145,6 +178,8 @@ def _from_description(account: dict, status_code: int, described: dict) -> dict:
             credit=float(described.get("credit") or 0),
         )
     if state == "claimed":
+        # The credits were granted today, so "now + validity" is the latest the
+        # grant can expire: at most one day later than the real deadline.
         return _result(
             account,
             ok=True,
@@ -152,6 +187,8 @@ def _from_description(account: dict, status_code: int, described: dict) -> dict:
             already_claimed=True,
             credit=float(described.get("credit") or 0),
             message=described.get("message") or "今日已领取",
+            next_expire_ts=_expiry_after_days(described.get("valid_days")),
+            expire_source=CAMPAIGN_EXPIRE_SOURCE,
         )
     return _result(
         account,
@@ -280,6 +317,7 @@ async def claim_checkin(account: dict) -> dict:
     replay = str(body.get("result") or body.get("status") or "").upper()
     if claim.status_code == 409 or replay == "ALREADY_CLAIMED" or body.get("replayed") is True:
         credit = _benefit_amount(body) or float(described.get("credit") or 0)
+        valid_days = _benefit_valid_days(body) or described.get("valid_days")
         return _remember(
             current,
             _result(
@@ -289,12 +327,15 @@ async def claim_checkin(account: dict) -> dict:
                 already_claimed=True,
                 credit=credit,
                 message="今日已领取" + _credit_text(credit),
+                next_expire_ts=_expiry_after_days(valid_days),
+                expire_source=CAMPAIGN_EXPIRE_SOURCE,
             ),
         )
     if claim.status_code >= 400 or str(body.get("status") or "").upper() not in {"", "CLAIMED"}:
         detail = str(body.get("message") or body.get("errorMessage") or claim.text[:180] or "")
         return _result(current, ok=False, status_code=claim.status_code, message=detail or f"领取失败 HTTP {claim.status_code}")
     credit = _benefit_amount(body) or float(described.get("credit") or 0)
+    valid_days = _benefit_valid_days(body) or described.get("valid_days")
     return _remember(
         current,
         _result(
@@ -304,5 +345,7 @@ async def claim_checkin(account: dict) -> dict:
             claimed=True,
             credit=credit,
             message="已领取" + _credit_text(credit),
+            next_expire_ts=_expiry_after_days(valid_days),
+            expire_source=CAMPAIGN_EXPIRE_SOURCE,
         ),
     )

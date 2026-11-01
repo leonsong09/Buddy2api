@@ -4,13 +4,14 @@ import os
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 
 import credential_crypto
 import database as db
 import providers
 import router
+import routing
 import server
-from providers.protocol import KeyChannelMismatch, UnknownModel
 from providers.qclaw.constants import STATIC_MODELS as QCLAW_STATIC
 from providers.qwenwork.constants import STATIC_MODELS as QWEN_STATIC
 from providers.traework.constants import STATIC_MODELS as TRAE_STATIC
@@ -47,14 +48,18 @@ def test_capacity_survives_supplier_catalog_and_public_listing(channel, isolated
 
 
 def test_public_models_omit_channels_without_login(monkeypatch):
+    # A channel is only advertised when it has an enabled account holding a
+    # token, so the stub rows carry the same fields a real row would.
     monkeypatch.setattr(server.db, "list_accounts", lambda provider=None: [
-        {"provider": "qoder", "access_token": "dt-present"},
-        {"provider": "workbuddy-i", "access_token": ""},
+        {"provider": "qoder", "status": "active", "access_token": "dt-present"},
+        {"provider": "workbuddy-i", "status": "active", "access_token": ""},
+        {"provider": "traework", "status": "inactive", "access_token": "dt-disabled"},
     ])
     monkeypatch.setattr(server, "collect_v1_models", lambda: [
         {"id": "qoder/Auto", "channel": "qoder"},
         {"id": "qoder-i/Auto", "channel": "qoder-i"},
         {"id": "workbuddy-i/glm-5.2", "channel": "workbuddy-i"},
+        {"id": "traework/doubao", "channel": "traework"},
         {"id": "glm-5.2", "channel": "workbuddy"},
     ])
     assert {item["id"] for item in server.public_v1_models()} == {"qoder/Auto"}
@@ -199,12 +204,13 @@ def test_explicit_output_budget_is_clamped_only_to_known_capacity(field):
 
 @pytest.mark.parametrize("responses_api", [False, True])
 def test_dispatch_clamps_capacity_after_alias_resolution(monkeypatch, responses_api):
-    from providers.protocol import BindResult
-
     class Provider:
         def translate_model(self, model):
             assert model == "alias"
             return "real-model"
+
+        def accepts_model(self, model):
+            return True
 
         def list_models(self):
             return [{"id": "real-model", "max_output_tokens": 64000}]
@@ -215,11 +221,15 @@ def test_dispatch_clamps_capacity_after_alias_resolution(monkeypatch, responses_
             return ("json", {"choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]})
 
     monkeypatch.setattr(providers, "get_provider", lambda channel: Provider())
-    bound = BindResult(channel="workbuddy", inner="alias", original="workbuddy/alias")
+    # One literal account, so the queue is not empty and the walk reaches dispatch.
+    monkeypatch.setattr(
+        routing, "channel_pool",
+        lambda channel: [{"id": 1, "provider": channel, "status": "active", "priority": 0}],
+    )
     if responses_api:
-        result = asyncio.run(router.responses_after_bind(bound, {"input": "hello", "max_output_tokens": 128000}, None))
+        result = asyncio.run(router.responses_after_name("workbuddy/alias", {"input": "hello", "max_output_tokens": 128000}, None))
     else:
-        result = asyncio.run(router.chat_after_bind(bound, {"messages": [], "max_tokens": 128000}, None))
+        result = asyncio.run(router.chat_after_name("workbuddy/alias", {"messages": [], "max_tokens": 128000}, None))
     assert result[0] == "json"
 
 QCLAW_HTTP_PAYLOAD = {
@@ -543,21 +553,29 @@ def test_supplier_catalog_refresh_keeps_channels_distinct(isolated_db, all_chann
     assert not qwenwork.accepts_model(TRAE_NEW_DOUBAO)
     assert not qwenwork.accepts_model(QCLAW_NEW_ID)
 
-    bound = router.bind({"model": "traework/" + TRAE_NEW_DOUBAO}, {"default_channel": "traework"})
-    assert bound.channel == "traework"
-    assert bound.inner == TRAE_NEW_DOUBAO
-    def attempt_chat(payload, key):
-        bound = router.bind(payload, key)
-        return asyncio.run(router.chat_after_bind(bound, payload, key))
+    traework_key = {"default_channel": "traework"}
+    assert router.admit_model(traework_key, "traework/" + TRAE_NEW_DOUBAO) == TRAE_NEW_DOUBAO
+    assert [
+        channel
+        for channel, _row in router.account_queue("traework/" + TRAE_NEW_DOUBAO, traework_key)
+    ] == ["traework"]
 
-    with pytest.raises(UnknownModel):
+    def attempt_chat(payload, key):
+        name = router.admit_model(key, payload["model"])
+        return asyncio.run(router.chat_after_name(name, payload, key))
+
+    with pytest.raises(HTTPException) as err:
         attempt_chat({"model": TRAE_NEW_DOUBAO, "messages": [{"role": "user", "content": "hi"}]}, {"default_channel": "workbuddy"})
-    with pytest.raises(UnknownModel):
+    assert err.value.detail["error"]["code"] == "unknown_model"
+    with pytest.raises(HTTPException) as err:
         attempt_chat({"model": TRAE_DOUBAO_TURBO, "messages": [{"role": "user", "content": "hi"}]}, {"default_channel": "workbuddy"})
-    with pytest.raises(KeyChannelMismatch):
+    assert err.value.detail["error"]["code"] == "unknown_model"
+    with pytest.raises(HTTPException) as err:
         attempt_chat({"model": "traework/" + TRAE_NEW_DOUBAO, "messages": [{"role": "user", "content": "hi"}]}, {"default_channel": "workbuddy"})
-    with pytest.raises(UnknownModel):
+    assert err.value.detail["error"]["code"] == "model_not_allowed"
+    with pytest.raises(HTTPException) as err:
         attempt_chat({"model": QCLAW_NEW_ID, "messages": [{"role": "user", "content": "hi"}]}, {"default_channel": "workbuddy"})
+    assert err.value.detail["error"]["code"] == "unknown_model"
 
     assert chat_hits == []
 

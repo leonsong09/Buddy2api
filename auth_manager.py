@@ -10,6 +10,8 @@ auth_manager.py — 多账号凭据管理
 """
 
 import asyncio
+import contextlib
+import contextvars
 import json
 import os
 import sys
@@ -23,6 +25,7 @@ import httpx
 
 import database as db
 import fingerprint
+import routing
 
 BACKEND = "https://copilot.tencent.com"
 DEFAULT_DOMAIN = "www.codebuddy.cn"
@@ -1177,15 +1180,14 @@ def _route_weight(account: dict) -> int:
 
 
 def _route_sort_key(account: dict):
-    weight = _route_weight(account)
-    total_requests = _route_int(account.get("total_requests"), 0)
-    return (
-        -_route_priority(account),
-        -weight,
-        total_requests / weight,
-        total_requests,
-        _route_int(account.get("id"), 0),
-    )
+    """Fill-first order — see routing.sort_key for the full explanation.
+
+    ``weight`` no longer takes part: traffic is spent exhaustively per account
+    (highest priority first, then the soonest-expiring quota), so a change to
+    the group never invalidates anybody's settings. This delegates to
+    routing.py so the picker and the management-page preview cannot drift.
+    """
+    return routing.sort_key(account, account.get("provider"))
 
 
 def workbuddy_channel_for_domain(domain: str) -> str:
@@ -1195,6 +1197,34 @@ def workbuddy_channel_for_domain(domain: str) -> str:
     return "workbuddy"
 
 
+# --------------------------------------------------------------- pinned hop
+# The dispatcher walks one queue of (channel, account) hops and must be able to
+# say "this attempt uses *that* account". While a hop runs the account is pinned
+# here, so a provider's own picker returns exactly the pinned account and never
+# quietly drifts to a different one.
+_pinned_account: contextvars.ContextVar = contextvars.ContextVar(
+    "buddy_pinned_account", default=None
+)
+
+
+@contextlib.contextmanager
+def pinned_account(account: Optional[dict]):
+    """Pin the account a single dispatch hop is allowed to use."""
+    token = _pinned_account.set(account)
+    try:
+        yield
+    finally:
+        _pinned_account.reset(token)
+
+
+def pinned_for(provider: str) -> Optional[dict]:
+    """The account pinned for `provider`, or None when the request may pick freely."""
+    account = _pinned_account.get()
+    if not isinstance(account, dict):
+        return None
+    if str(account.get("provider") or "") != str(provider or ""):
+        return None
+    return account
 def account_attempt_limit(provider: str, *, refresh_retry: bool = False) -> int:
     """Budget for the whole channel pool, including refreshable expired accounts.
 
@@ -1210,12 +1240,31 @@ def pick_account(
     exclude_ids: set[int] = None,
     provider: str = "workbuddy",
 ) -> Optional[dict]:
-    """Pick an available account. Higher priority first; stick to the current one on ties."""
+    """Pick the account to spend next: highest priority, then most urgent.
+
+    Stickiness keeps one account serving consecutive requests — that is what
+    drains it instead of spreading load — but it is abandoned as soon as the
+    account reaches its protective cap or runs out, so a single account is
+    never asked to absorb everything.
+
+    A pinned hop overrides both stickiness and priority: the dispatcher already
+    decided which account goes next, and this picker must not second-guess it.
+    """
     exclude_ids = exclude_ids or set()
+    pinned = pinned_for(provider)
+    if pinned is not None:
+        aid = int(pinned.get("id") or 0)
+        if not aid or aid in exclude_ids or account_is_cooling_down(aid):
+            return None
+        routing.note_pick(aid)
+        return db.get_account(aid) or pinned
+
     accounts = db.get_active_accounts(provider)
     candidates = [
         a for a in accounts
-        if a["id"] not in exclude_ids and not account_is_cooling_down(a["id"])
+        if a["id"] not in exclude_ids
+        and not account_is_cooling_down(a["id"])
+        and routing.account_available(a)
     ]
     if not candidates:
         return None
@@ -1226,11 +1275,13 @@ def pick_account(
         sticky_id = _sticky_account_id.get(provider)
         if sticky_id is not None:
             sticky = next((a for a in top_candidates if a["id"] == sticky_id), None)
-            if sticky:
+            if sticky:  # rate limits no longer steer routing; keep the sticky account as-is
+                routing.note_pick(sticky["id"])
                 return sticky
 
         chosen = sorted(top_candidates, key=_route_sort_key)[0]
         _sticky_account_id[provider] = chosen["id"]
+        routing.note_pick(chosen["id"])
         return chosen
 
 
@@ -1239,6 +1290,9 @@ async def pick_account_with_fallback(
     provider: str = "workbuddy",
 ) -> Optional[dict]:
     """Pick an account; refresh expired ones if needed. Only refreshes the same provider."""
+    if pinned_for(provider) is not None:
+        # A pinned hop must not drift: no expired sweep, no other account.
+        return pick_account(exclude_ids, provider=provider)
     account = pick_account(exclude_ids, provider=provider)
     if account:
         return account

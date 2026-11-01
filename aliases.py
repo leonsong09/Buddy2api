@@ -6,11 +6,18 @@ Legacy flat `model_aliases` settings are treated as WorkBuddy-only.
 
 from __future__ import annotations
 
+import os
 import sqlite3
+import sys
 
 import database as db
 
 SETTING = "model_aliases"
+
+# 开启后，每次别名解析（请求路径上的真实解析）都会打印一行到 stderr，
+# 格式： [alias] channel=<通道> requested=<客户端给的模型名> resolved=<最终落到后端的模型ID>
+# 默认关闭，需设置环境变量 BUDDY_DEBUG_ALIAS=1（任意非空值）才生效。
+_DEBUG_ALIAS = bool(os.environ.get("BUDDY_DEBUG_ALIAS"))
 
 
 class AliasError(ValueError):
@@ -90,7 +97,16 @@ def resolve(channel: str, model: str) -> str:
     value = (model or "").strip()
     if not value:
         return value
-    return merged_map(channel).get(value, value)
+    resolved = merged_map(channel).get(value, value)
+    if _DEBUG_ALIAS and resolved != value:
+        try:
+            sys.stderr.write(
+                f"[alias] channel={channel} requested={value!r} resolved={resolved!r}\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
+    return resolved
 
 
 def builtin_keys(channel: str) -> set[str]:

@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -11,7 +12,7 @@ from providers.xiaohuanxiong.headers import client_headers
 from providers.xiaohuanxiong.models import parse_supplier_models
 from providers.xiaohuanxiong.quota import _today_points, parse_balance, parse_bills
 from providers.xiaohuanxiong import store
-from providers.xiaohuanxiong.store import session_to_account
+from providers.xiaohuanxiong.store import auth_candidates, session_to_account
 
 
 @pytest.fixture()
@@ -93,7 +94,7 @@ def test_claim_reports_existing_daily_bill(isolated_db, monkeypatch):
             return 200, {"code": 0, "data": {}}
         return 200, {"data": [{"points": 20, "created_at": datetime.now().astimezone().isoformat(), "event_name": "daily"}]}
 
-    monkeypatch.setattr(quota, "refresh_account", fake_refresh)
+    monkeypatch.setattr(quota, "ensure_ready", fake_refresh)
     monkeypatch.setattr(quota, "_get", fake_get)
     result = asyncio.run(quota.claim_checkin(account))
     assert result["ok"] is True
@@ -101,6 +102,303 @@ def test_claim_reports_existing_daily_bill(isolated_db, monkeypatch):
     assert result["credit"] == 20
 
 
+def _jwt(sub: str, exp: int = 1795278853) -> str:
+    header = base64.urlsafe_b64encode(json.dumps({"alg": "HS256", "typ": "JWT"}).encode()).decode().rstrip("=")
+    payload = base64.urlsafe_b64encode(json.dumps({"sub": sub, "exp": exp, "iss": "xiaohuanxiong.com/iam"}).encode()).decode().rstrip("=")
+    return f"{header}.{payload}.sig"
+
+
+def test_session_to_account_falls_back_to_jwt_sub():
+    """The desktop auth.json only has access_token and office_identity. The JWT `sub`
+    is parsed into the uid so each account keeps a stable, distinct identity."""
+    token = _jwt("pu-01a16474-fead-79f5-be91-db8d7bf0b5a6")
+    parsed = session_to_account({"access_token": token, "office_identity": "personal"})
+    assert parsed["uid"] == "pu-01a16474-fead-79f5-be91-db8d7bf0b5a6"
+    assert parsed["name"] == "小浣熊-b5a6"
+    assert parsed["access_token"] == token
+    assert parsed["expires_at"] == 1795278853000
+
+
+def test_session_to_account_explicit_uid_wins_over_jwt_sub():
+    token = _jwt("pu-from-jwt")
+    parsed = session_to_account({"access_token": token, "user_id": "42"})
+    assert parsed["uid"] == "42"
+
+
+def test_session_to_account_without_jwt_keeps_distinct_default_name():
+    """When neither a user_id nor a parseable JWT `sub` is available the uid falls back
+    to a sha256 digest of the token material, so distinct accounts still stay distinct."""
+    parsed = session_to_account({"access_token": "not-a-jwt", "refresh_token": "r"})
+    assert parsed["uid"].startswith("tok-")
+    assert parsed["uid"] != "小浣熊"
+
+
+def test_auth_candidates_includes_office_raccoon_agent_dir(monkeypatch, tmp_path):
+    """The SenseTime desktop agent writes ~/.office-raccoon/agent/config/auth.json,
+    not the .box-agent path the code used to probe."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.delenv("CB_XHX_AUTH_DIR", raising=False)
+    monkeypatch.delenv("CB_XIAOHUANXIONG_AUTH_DIR", raising=False)
+    paths = [str(p) for p in auth_candidates()]
+    assert any(".office-raccoon" in p and p.endswith("auth.json") for p in paths)
+    # the historical probe paths stay, so already-configured installs keep working
+    assert any(".box-agent" in p for p in paths)
+    # the new candidate must resolve under the patched home, not the real one
+    assert any(str(home) in p and ".office-raccoon" in p for p in paths)
+
+
+def test_resync_from_disk_adopts_rotated_token(isolated_db, monkeypatch, tmp_path):
+    """The desktop client exposes no refresh_token, so a re-login there rotates the
+    access token and the DB copy goes stale (401). resync_from_disk must adopt the
+    new token from the client's auth.json instead of failing."""
+    from providers.xiaohuanxiong import store as xhx_store
+    from providers.xiaohuanxiong import token as xhx_token
+
+    auth_dir = tmp_path / ".office-raccoon" / "agent" / "config"
+    auth_dir.mkdir(parents=True)
+    monkeypatch.setattr(xhx_store, "auth_candidates", lambda: [auth_dir / "auth.json"])
+
+    stale = _jwt("pu-rotated")
+    fresh = _jwt("pu-rotated", exp=1795365253)
+    (auth_dir / "auth.json").write_text(
+        json.dumps({"access_token": fresh, "office_identity": "personal"}), encoding="utf-8"
+    )
+    account_id = db.add_account(
+        {
+            "name": "pu-rotated",
+            "uid": "pu-rotated",
+            "provider": "xiaohuanxiong",
+            "access_token": stale,
+            "expires_at": 9_999_999_999_999,
+        }
+    )
+    account = db.get_account(account_id)
+
+    patched = xhx_token.resync_from_disk(account)
+    assert patched is not None
+    assert patched["access_token"] == fresh
+    assert db.get_account(account_id)["access_token"] == fresh
+
+    # A second call within the TTL window must not re-read the disk.
+    def _boom():
+        raise AssertionError("should not re-read")
+
+    monkeypatch.setattr(xhx_store, "auth_candidates", _boom)
+    assert xhx_token.resync_from_disk(account) is None
+
+
+def test_resync_from_disk_skips_other_accounts(isolated_db, monkeypatch, tmp_path):
+    """auth.json only ever holds one account, so a resync must never steal a token
+    belonging to a different uid."""
+    from providers.xiaohuanxiong import store as xhx_store
+    from providers.xiaohuanxiong import token as xhx_token
+
+    auth_dir = tmp_path / ".office-raccoon" / "agent" / "config"
+    auth_dir.mkdir(parents=True)
+    monkeypatch.setattr(xhx_store, "auth_candidates", lambda: [auth_dir / "auth.json"])
+    (auth_dir / "auth.json").write_text(
+        json.dumps({"access_token": _jwt("pu-someone-else"), "office_identity": "personal"}),
+        encoding="utf-8",
+    )
+    account_id = db.add_account(
+        {
+            "name": "mine",
+            "uid": "pu-mine",
+            "provider": "xiaohuanxiong",
+            "access_token": _jwt("pu-mine"),
+            "expires_at": 9_999_999_999_999,
+        }
+    )
+    assert xhx_token.resync_from_disk(db.get_account(account_id)) is None
+
+
+def test_refresh_account_without_refresh_token_hits_upstream(isolated_db, monkeypatch):
+    """The desktop client never writes a refresh_token. Renewing such an account used
+    to return the account untouched whenever exp had not passed, so 续期 reported
+    success while every API call kept failing with 401. It must really call the
+    upstream instead."""
+    from providers.xiaohuanxiong import token as xhx_token
+
+    calls: list[str] = []
+
+    async def fake_exchange(account, refresh):
+        calls.append(refresh)
+        return {**account, "access_token": "rotated"}
+
+    monkeypatch.setattr(xhx_token, "_exchange", fake_exchange)
+    async def alive_probe(token):
+        return True
+
+    monkeypatch.setattr(xhx_token, "probe_token", alive_probe)
+
+    account = {
+        "id": 1,
+        "uid": "pu-1",
+        "access_token": "old",
+        "refresh_token": "",
+        "expires_at": 9_999_999_999_999,
+    }
+    refreshed = asyncio.run(xhx_token.refresh_account(account))
+    assert refreshed["access_token"] == "rotated"
+    # the access token itself is used as the refresh credential
+    assert calls == ["old"]
+
+
+def test_refresh_account_reports_failure_when_upstream_rejects(isolated_db, monkeypatch):
+    """A revoked session must surface as a failed 续期, never as a silent success."""
+    from providers.xiaohuanxiong import token as xhx_token
+
+    async def failing_exchange(account, refresh):
+        raise xhx_token.XiaohuanxiongAuthError("refresh failed: HTTP 401")
+
+    monkeypatch.setattr(xhx_token, "_exchange", failing_exchange)
+    async def alive_probe(token):
+        return True
+
+    monkeypatch.setattr(xhx_token, "probe_token", alive_probe)
+
+    account_id = db.add_account(
+        {
+            "name": "pu-2",
+            "uid": "pu-2",
+            "provider": "xiaohuanxiong",
+            "access_token": "dead",
+            "refresh_token": "",
+            "expires_at": 9_999_999_999_999,
+        }
+    )
+    account = db.get_account(account_id)
+    with pytest.raises(xhx_token.XiaohuanxiongAuthError):
+        asyncio.run(xhx_token.refresh_account(account))
+    # a dead session must show up as expired in the admin page, not 正常
+    assert db.get_account(account_id)["status"] == "expired"
+
+
+def test_ensure_ready_probes_token_before_trusting_exp(isolated_db, monkeypatch):
+    """A token whose exp has not passed can still be revoked server-side. ensure_ready
+    must probe it instead of returning it as-is."""
+    from providers.xiaohuanxiong import token as xhx_token
+
+    probed: list[str] = []
+
+    async def fake_probe(token):
+        probed.append(token)
+        return False
+
+    monkeypatch.setattr(xhx_token, "probe_token", fake_probe)
+    monkeypatch.setattr(
+        xhx_token, "resync_from_disk", lambda account: {**account, "access_token": "from-disk"}
+    )
+
+
+    account = {"id": 3, "uid": "pu-3", "access_token": "revoked", "refresh_token": "", "expires_at": 9999999999999}
+    ready = asyncio.run(xhx_token.ensure_ready(account))
+    assert probed == ["revoked"]
+    assert ready["access_token"] == "from-disk"
+
+
+def test_probe_token_treats_http_errors_as_dead(monkeypatch):
+    from providers.xiaohuanxiong import token as xhx_token
+
+    class FakeResponse:
+        status_code = 401
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, headers=None):
+            return FakeResponse()
+
+    monkeypatch.setattr(xhx_token.httpx, "AsyncClient", lambda *a, **kw: FakeClient())
+
+
+    assert asyncio.run(xhx_token.probe_token("dead")) is False
+
+
+def test_probe_token_tolerates_network_blips(monkeypatch):
+    """A transient network error must not be reported as a dead login."""
+    from providers.xiaohuanxiong import token as xhx_token
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, headers=None):
+            raise xhx_token.httpx.HTTPError("boom")
+
+    monkeypatch.setattr(xhx_token.httpx, "AsyncClient", lambda *a, **kw: FakeClient())
+
+
+    assert asyncio.run(xhx_token.probe_token("anything")) is True
+
+
+def test_ensure_ready_prefers_refresh_token(isolated_db, monkeypatch):
+    """A refresh_token, when the user did supply one, still takes priority over the
+    on-disk resync."""
+    from providers.xiaohuanxiong import token as xhx_token
+
+    calls: list[str] = []
+
+    async def fake_refresh(account):
+        calls.append("refresh")
+        return {**account, "access_token": "refreshed"}
+
+    def boom_resync(account):
+        calls.append("resync")
+        return None
+
+    monkeypatch.setattr(xhx_token, "refresh_account", fake_refresh)
+    monkeypatch.setattr(xhx_token, "resync_from_disk", boom_resync)
+
+    account = {
+        "id": 1,
+        "uid": "u",
+        "access_token": "stale",
+        "refresh_token": "r",
+        "expires_at": 1,
+    }
+    ready = asyncio.run(xhx_token.ensure_ready(account))
+    assert ready["access_token"] == "refreshed"
+    assert calls == ["refresh"]
+
+
+def test_ensure_ready_falls_back_to_disk_resync(isolated_db, monkeypatch):
+    from providers.xiaohuanxiong import token as xhx_token
+
+    async def broken_refresh(account):
+        raise xhx_token.XiaohuanxiongAuthError("no refresh token")
+
+    monkeypatch.setattr(xhx_token, "refresh_account", broken_refresh)
+    monkeypatch.setattr(
+        xhx_token, "resync_from_disk", lambda account: {**account, "access_token": "from-disk"}
+    )
+
+    account = {"id": 2, "uid": "u", "access_token": "stale", "refresh_token": "", "expires_at": 1}
+    ready = asyncio.run(xhx_token.ensure_ready(account))
+    assert ready["access_token"] == "from-disk"
+
+
+def test_ensure_ready_raises_when_nothing_available(isolated_db, monkeypatch):
+    from providers.xiaohuanxiong import token as xhx_token
+
+    async def broken_refresh(account):
+        raise xhx_token.XiaohuanxiongAuthError("no refresh token")
+
+    monkeypatch.setattr(xhx_token, "refresh_account", broken_refresh)
+    monkeypatch.setattr(xhx_token, "resync_from_disk", lambda account: None)
+
+    account = {"id": 3, "uid": "u", "access_token": "stale", "refresh_token": "", "expires_at": 1}
+    with pytest.raises(xhx_token.XiaohuanxiongAuthError):
+        asyncio.run(xhx_token.ensure_ready(account))
 class _Response:
     def __init__(self, status, body="", lines=None, payload=None):
         self.status_code = status
@@ -254,14 +552,6 @@ def test_nonstream_retry_keeps_raw_error_then_records_success(monkeypatch):
         (502, "retry", 9, False, 0, "bad gateway"),
         (200, "stop", 9, True, 7, ""),
     ]
-
-
-def _jwt(sub: str) -> str:
-    header = base64.urlsafe_b64encode(b'{"alg":"none"}').decode("ascii").rstrip("=")
-    payload = base64.urlsafe_b64encode(
-        json.dumps({"sub": sub, "exp": 1893456000}).encode("utf-8")
-    ).decode("ascii").rstrip("=")
-    return f"{header}.{payload}.sig"
 
 
 def test_login_without_user_id_uses_token_subject():

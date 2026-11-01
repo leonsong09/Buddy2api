@@ -3,12 +3,12 @@ import json
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 
 import credential_crypto
 import database as db
 import providers
 import router
-from providers.protocol import UnknownModel
 from providers.traework.chat import (
     _stream_once,
     conversation_prompt,
@@ -17,7 +17,7 @@ from providers.traework.chat import (
     translate_model,
 )
 from providers.traework.crypto import decrypt_tc_b64, encrypt_tc_b64
-from providers.traework.store import parse_credentials, traework_auth_dirs
+from providers.traework.store import parse_credentials, traework_auth_dirs, traework_user_data_dir
 
 
 @pytest.fixture()
@@ -80,13 +80,13 @@ def test_parse_credentials_requires_token():
 
 
 def test_bind_traework_when_enabled(isolated_db, traework_enabled):
-    bound = router.bind({"model": "auto"}, {"default_channel": "traework"})
-    assert bound.channel == "traework"
-    assert bound.inner == "auto"
-    bound = router.bind({"model": "traework/qwen-3.7-plus"}, {"default_channel": "traework"})
-    assert bound.inner == "qwen-3.7-plus"
-    with pytest.raises(UnknownModel):
-        router.bind({"model": "glm-5.2"}, {"default_channel": "traework"})
+    key = {"default_channel": "traework"}
+    assert router.admit_model(key, "auto") == "auto"
+    assert router.admit_model(key, "traework/qwen-3.7-plus") == "qwen-3.7-plus"
+    with pytest.raises(HTTPException) as err:
+        router.admit_model(key, "glm-5.2")
+    assert err.value.status_code == 400
+    assert err.value.detail["error"]["code"] == "unknown_model"
 
 
 def test_parse_supplier_models_official_grouped_list():
@@ -547,6 +547,39 @@ def test_traework_auth_dirs_ignore_workbuddy_cb_auth_dir(monkeypatch, tmp_path):
     assert wb.resolve() not in dirs
 
 
+@pytest.mark.parametrize("folder", ["Trae CN", "TRAE SOLO CN", "Trae SOLO CN", "TRAE CN"])
+def test_traework_user_data_dir_finds_renamed_install(monkeypatch, tmp_path, folder):
+    """The installer folder name changed across versions. Discovery must not
+    report exists=False on a machine that is actually logged in."""
+    appdata = tmp_path / "Roaming"
+    appdata.mkdir()
+    monkeypatch.delenv("CB_TRAEWORK_USER_DATA_DIR", raising=False)
+    monkeypatch.setenv("APPDATA", str(appdata))
+    (appdata / folder / "User" / "globalStorage").mkdir(parents=True)
+    (appdata / folder / "User" / "globalStorage" / "storage.json").write_text("{}", encoding="utf-8")
+
+    assert traework_user_data_dir() == appdata / folder
+    dirs = [path for path in traework_auth_dirs()]
+    assert (appdata / folder / "User" / "globalStorage" / "storage.json").is_file()
+    assert any(path.name == "globalStorage" for path in dirs)
+
+
+def test_traework_user_data_dir_falls_back_when_absent(monkeypatch, tmp_path):
+    appdata = tmp_path / "Roaming"
+    appdata.mkdir()
+    monkeypatch.delenv("CB_TRAEWORK_USER_DATA_DIR", raising=False)
+    monkeypatch.setenv("APPDATA", str(appdata))
+    assert traework_user_data_dir() == appdata / "TRAE SOLO CN"
+
+
+def test_traework_user_data_dir_honours_override(monkeypatch, tmp_path):
+    custom = tmp_path / "custom-trae"
+    custom.mkdir()
+    monkeypatch.setenv("CB_TRAEWORK_USER_DATA_DIR", str(custom))
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+    assert traework_user_data_dir() == custom
+
+
 def test_traework_auth_dirs_include_newer_trae_cn(monkeypatch, tmp_path):
     monkeypatch.delenv("CB_TRAEWORK_AUTH_DIR", raising=False)
     monkeypatch.delenv("CB_TRAEWORK_USER_DATA_DIR", raising=False)
@@ -732,11 +765,11 @@ def test_responses_bridge_accepts_traework_text_sse(isolated_db, traework_enable
     provider = providers.get_provider("traework")
     monkeypatch.setattr(provider, "chat_completions", string_stream)
     original = "traework/qwen-3.7-plus"
-    bound = router.bind({"model": original}, {"default_channel": "traework"})
+    db.add_account({"name": "tw", "uid": "tw", "provider": "traework", "priority": 0})
 
     async def collect_events():
-        result = await router.responses_after_bind(
-            bound,
+        result = await router.responses_after_name(
+            original,
             {"model": original, "input": "hi", "stream": True},
             {"id": 1, "name": "dsh-key", "default_channel": "traework"},
         )

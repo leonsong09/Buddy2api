@@ -134,8 +134,8 @@ def _dpapi_decrypt(data: bytes) -> bytes:
 
 
 def encrypt_secret(value: str | None, db_path: Path) -> str:
-    if not value or is_encrypted(value):
-        return value or ""
+    if not isinstance(value, str) or not value or is_encrypted(value):
+        return value if isinstance(value, str) else ""
     raw = value.encode("utf-8")
     # Always Fernet (MASTER_KEY or sidecar key file). Linux Docker cannot open
     # Windows DPAPI rows; existing enc:v1:dpapi: values still decrypt on Windows.
@@ -144,7 +144,7 @@ def encrypt_secret(value: str | None, db_path: Path) -> str:
 
 
 def decrypt_secret(value: str | None, db_path: Path) -> str:
-    if not value:
+    if not isinstance(value, str) or not value:
         return ""
     if not is_encrypted(value):
         return value

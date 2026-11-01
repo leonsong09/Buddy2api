@@ -178,12 +178,13 @@ def _period_slice(conn: sqlite3.Connection, period: str) -> dict:
     daily = _fill_daily(conn, start_day, window["days"], start_ts, end_ts)
     model_stats = conn.execute(
         """
-        SELECT model, COUNT(*) as count, COALESCE(SUM(total_tokens),0) as tokens,
+        SELECT COALESCE(resolved_model, model) as model, COUNT(*) as count,
+               COALESCE(SUM(total_tokens),0) as tokens,
                COALESCE(SUM(credit),0) as credit,
                COALESCE(AVG(duration_ms),0) as avg_duration_ms
         FROM logs
         WHERE created_at >= ? AND created_at < ?
-        GROUP BY model ORDER BY count DESC LIMIT 10
+        GROUP BY COALESCE(resolved_model, model) ORDER BY count DESC LIMIT 10
         """,
         (start_ts, end_ts),
     ).fetchall()
@@ -279,6 +280,31 @@ def connection():
         yield conn
     finally:
         conn.close()
+
+
+def _account_text(value) -> Optional[str]:
+    """把账号字段收敛成 TEXT；dict/list 这类上游畸形值降级为空串。"""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return ""
+
+
+def _epoch_int(value) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return int(value)
+
+
+def _extra_text(value) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, str):
+        return value
+    return str(value)
 
 
 def _protect_account_data(data: dict) -> dict:
@@ -406,6 +432,7 @@ def init_db():
         _migrate_api_keys(conn)
         _migrate_workbuddy_regions(conn)
         _migrate_logs_provider(conn)
+        _migrate_logs_resolved_model(conn)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS api_key_daily_usage (
                 api_key_id    INTEGER NOT NULL,
@@ -480,6 +507,10 @@ def _migrate_accounts(conn: sqlite3.Connection):
             SET credit_baseline=COALESCE(total_credits, 0)
             WHERE credit_limit IS NOT NULL AND credit_limit > 0
         """)
+    # NULL means "use the automatic value"; routing.urgency_days() falls back to
+    # the channel default. A number is a manual override that wins outright.
+    if "urgency_days" not in cols:
+        conn.execute("ALTER TABLE accounts ADD COLUMN urgency_days REAL")
     conn.execute("UPDATE accounts SET weight=1 WHERE weight IS NULL OR weight < 1")
     conn.execute("UPDATE accounts SET priority=0 WHERE priority IS NULL")
     conn.execute("UPDATE accounts SET credit_limit=0 WHERE credit_limit IS NULL OR credit_limit < 0")
@@ -644,9 +675,27 @@ def _migrate_logs_provider(conn: sqlite3.Connection):
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(logs)").fetchall()}
     if "provider" not in cols:
         conn.execute("ALTER TABLE logs ADD COLUMN provider TEXT")
-    if "resolved_model" not in cols:
-        conn.execute("ALTER TABLE logs ADD COLUMN resolved_model TEXT DEFAULT ''")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_provider ON logs(provider)")
+
+
+def _migrate_logs_resolved_model(conn: sqlite3.Connection):
+    # Schema DDL must not ride an already-open transaction: init_db's
+    # executescript leaves one open (Python 3.13 no longer commits for it), and
+    # SQLite answers CREATE INDEX with "unable to open database file" when a
+    # RENAME COLUMN happened in that same uncommitted transaction.
+    if conn.in_transaction:
+        conn.commit()
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(logs)").fetchall()}
+    if "resolved_model" not in cols:
+        if "model_resolved" in cols:
+            # Our old spelling; the upstream column name won (RENAME COLUMN
+            # keeps every row, needs SQLite >= 3.25; bundled here is 3.45.3).
+            conn.execute("ALTER TABLE logs RENAME COLUMN model_resolved TO resolved_model")
+        else:
+            conn.execute("ALTER TABLE logs ADD COLUMN resolved_model TEXT")
+    conn.execute("DROP INDEX IF EXISTS idx_logs_model_resolved")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_resolved_model ON logs(resolved_model)")
+    conn.commit()
 
 
 def _migrate_account_credentials(conn: sqlite3.Connection):
@@ -707,13 +756,7 @@ def add_account(data: dict) -> int:
     credit_limit = max(0.0, float(data.get("credit_limit", 0) or 0))
     credit_baseline = max(0.0, float(data.get("credit_baseline", 0) or 0))
     provider = str(data.get("provider") or "workbuddy").strip() or "workbuddy"
-    extra = data.get("extra")
-    if isinstance(extra, dict):
-        extra_text = json.dumps(extra, ensure_ascii=False)
-    elif extra is None:
-        extra_text = None
-    else:
-        extra_text = str(extra)
+    extra_text = _extra_text(data.get("extra"))
     with _lock:
         conn = get_conn()
         cur = conn.execute("""
@@ -724,19 +767,19 @@ def add_account(data: dict) -> int:
                  created_at, updated_at)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
-            data.get("name", ""),
-            data.get("uid", ""),
-            data.get("nickname", ""),
-            data.get("phone", ""),
-            data.get("account_type", "personal"),
-            data.get("access_token", ""),
-            data.get("refresh_token", ""),
-            data.get("expires_at", 0),
-            data.get("refresh_expires_at", 0),
-            data.get("domain", "www.codebuddy.cn"),
-            data.get("enterprise_id", ""),
-            data.get("session_state", ""),
-            data.get("status", "active"),
+            _account_text(data.get("name")) or "",
+            _account_text(data.get("uid")) or "",
+            _account_text(data.get("nickname")) or "",
+            _account_text(data.get("phone")) or "",
+            _account_text(data.get("account_type")) or "personal",
+            _account_text(data.get("access_token")) or "",
+            _account_text(data.get("refresh_token")) or "",
+            _epoch_int(data.get("expires_at")),
+            _epoch_int(data.get("refresh_expires_at")),
+            _account_text(data.get("domain")) or "www.codebuddy.cn",
+            _account_text(data.get("enterprise_id")) or "",
+            _account_text(data.get("session_state")) or "",
+            _account_text(data.get("status")) or "active",
             weight,
             priority,
             credit_limit,
@@ -759,18 +802,27 @@ def update_account(aid: int, data: dict):
     for k in ["name", "uid", "nickname", "phone", "account_type", "access_token",
               "refresh_token", "expires_at", "refresh_expires_at", "domain",
               "enterprise_id", "session_state", "status", "weight", "priority",
-              "credit_limit", "credit_baseline", "provider", "extra"]:
+              "credit_limit", "credit_baseline", "provider", "extra", "urgency_days"]:
         if k in data:
             if k == "weight":
                 data[k] = max(1, int(data[k] or 1))
             elif k == "priority":
                 data[k] = int(data[k] or 0)
+            elif k == "urgency_days":
+                # None/"" clears the override so the automatic value applies.
+                raw_urgency = data[k]
+                data[k] = None if raw_urgency in (None, "") else max(0.0, float(raw_urgency))
             elif k in {"credit_limit", "credit_baseline"}:
                 data[k] = max(0.0, float(data[k] or 0))
             elif k == "provider":
                 data[k] = str(data[k] or "workbuddy").strip() or "workbuddy"
-            elif k == "extra" and isinstance(data[k], dict):
-                data[k] = json.dumps(data[k], ensure_ascii=False)
+            elif k == "extra":
+                data[k] = _extra_text(data[k])
+            elif k in {"expires_at", "refresh_expires_at"}:
+                data[k] = _epoch_int(data[k])
+            elif isinstance(data[k], (dict, list)):
+                # 上游 auth 文件可能给出 dict/list（例如加密信封），TEXT 列收敛成空串。
+                data[k] = ""
             fields.append(f"{k}=?")
             values.append(data[k])
     if not fields:
@@ -855,14 +907,71 @@ def account_increment_usage(aid: int, tokens: int, credit: float):
 # Account cache
 # ============================================================
 
-def upsert_account_resource_cache(account_id: int, payload: dict):
+def _payload_remaining(payload: dict) -> Optional[float]:
+    """Best-effort remaining quota out of a cached resource payload."""
+    if not isinstance(payload, dict):
+        return None
+    for key in ("remaining", "available_total", "total_dosage"):
+        value = payload.get(key)
+        if value is None or value == "":
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+# Keys `get_account_resource_cache` adds to every read; they are never stored.
+_RESOURCE_CACHE_META = ("cached", "cache_updated_at", "age_seconds")
+
+
+def _write_account_resource_cache(account_id: int, payload: dict, *, merge: bool) -> dict:
     now = int(time.time())
-    safe_payload = dict(payload or {})
+    safe_payload = {
+        key: value
+        for key, value in dict(payload or {}).items()
+        if key not in _RESOURCE_CACHE_META
+    }
     safe_payload["cached"] = False
     safe_payload["stale"] = False
     safe_payload["updated_at"] = int(safe_payload.get("updated_at") or now)
     with _lock:
         conn = get_conn()
+        # Carry the highest quota ever seen forward. Routing uses it as the
+        # denominator of "how empty is this account", because the current
+        # remaining value alone cannot tell 3/3 from 3/3000.
+        previous_peak = None
+        stored = {}
+        row = conn.execute(
+            "SELECT payload FROM account_resource_cache WHERE account_id=?",
+            (account_id,),
+        ).fetchone()
+        if row:
+            try:
+                stored = json.loads(row["payload"] or "{}")
+                if not isinstance(stored, dict):
+                    stored = {}
+                previous_peak = _payload_remaining(stored)
+                stored_peak = stored.get("peak_remaining")
+                if stored_peak not in (None, ""):
+                    stored_peak = float(stored_peak)
+                    if previous_peak is None or stored_peak > previous_peak:
+                        previous_peak = stored_peak
+            except (json.JSONDecodeError, TypeError, ValueError):
+                stored = {}
+                previous_peak = None
+        if merge:
+            # A partial observation (one quota reading, one deadline) must not
+            # erase the keys it did not look at — the expiry a check-in cached
+            # and the number a quota check measured have to survive each other.
+            merged = dict(stored)
+            merged.update(safe_payload)
+            safe_payload = merged
+        current = _payload_remaining(safe_payload)
+        peak = max([v for v in (previous_peak, current) if v is not None], default=None)
+        if peak is not None:
+            safe_payload["peak_remaining"] = peak
         conn.execute(
             """
             INSERT INTO account_resource_cache (account_id, payload, updated_at)
@@ -875,6 +984,22 @@ def upsert_account_resource_cache(account_id: int, payload: dict):
         )
         conn.commit()
         conn.close()
+    return safe_payload
+
+
+def upsert_account_resource_cache(account_id: int, payload: dict):
+    """Replace the cached row with a complete snapshot."""
+    return _write_account_resource_cache(account_id, payload, merge=False)
+
+
+def merge_account_resource_cache(account_id: int, payload: dict) -> dict:
+    """Merge observed keys into the cached row, keeping what was already known.
+
+    Use this for a partial observation. ``upsert_account_resource_cache``
+    replaces the whole payload, so a writer that only measured a quota number
+    would silently drop the deadline another writer cached, and vice versa.
+    """
+    return _write_account_resource_cache(account_id, payload, merge=True)
 
 
 def get_account_resource_cache(account_id: int) -> Optional[dict]:
@@ -1112,6 +1237,16 @@ def api_key_increment_usage(kid: int, tokens: int):
 # Logs
 # ============================================================
 
+def _resolved_of(data: dict) -> str:
+    """The model the provider actually called, in the single ``resolved_model``
+    column (upstream spelling). Falls back to the alias so a row is never blank.
+    """
+    return (
+        data.get("resolved_model")
+        or data.get("model", "")
+    )
+
+
 def add_log(data: dict):
     now = int(time.time())
     with _lock:
@@ -1131,7 +1266,7 @@ def add_log(data: dict):
             data.get("finish_reason", ""), data.get("duration_ms", 0),
             data.get("status_code", 200), data.get("error_msg", ""),
             data.get("provider") or "workbuddy",
-            data.get("resolved_model", ""), now,
+            _resolved_of(data), now,
         ))
         conn.commit()
         conn.close()
@@ -1146,20 +1281,21 @@ def record_request(data: dict):
             conn.execute(
                 """
                 INSERT INTO logs
-                    (api_key_id, api_key_name, account_id, account_name, model, stream,
+                    (api_key_id, api_key_name, account_id, account_name, model, resolved_model, stream,
                      prompt_tokens, completion_tokens, total_tokens, credit,
-                     finish_reason, duration_ms, status_code, error_msg, provider, resolved_model, created_at)
+                     finish_reason, duration_ms, status_code, error_msg, provider, created_at)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     data.get("api_key_id"), data.get("api_key_name"),
                     data.get("account_id"), data.get("account_name"),
-                    data.get("model", ""), data.get("stream", 0),
+                    data.get("model", ""), _resolved_of(data),
+                    data.get("stream", 0),
                     data.get("prompt_tokens", 0), data.get("completion_tokens", 0),
                     data.get("total_tokens", 0), data.get("credit", 0),
                     data.get("finish_reason", ""), data.get("duration_ms", 0),
                     data.get("status_code", 200), data.get("error_msg", ""),
-                    data.get("provider") or "workbuddy", data.get("resolved_model", ""), now,
+                    data.get("provider") or "workbuddy", now,
                 ),
             )
             if data.get("account_id") and data.get("increment_usage", True):

@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import pytest
 
@@ -146,3 +147,78 @@ def test_startup_does_not_import_by_default(isolated_db, monkeypatch):
     summary = control_plane.startup_scan()
     assert summary["auto_import"] is False
     assert "imported" not in called
+
+
+def test_encrypted_envelope_auth_file_is_rejected_not_imported(isolated_db, tmp_path):
+    """accessToken 是 {"$wbEncrypted":1,"envelope":...} 时不能进库，也不能把 import 打成 500。"""
+    info = tmp_path / "desktop.info"
+    info.write_text(
+        json.dumps({
+            "account": {"uid": "u-enc", "nickname": {"$wbEncrypted": 1, "envelope": "abc"}},
+            "auth": {
+                "accessToken": {"$wbEncrypted": 1, "envelope": "abc"},
+                "refreshToken": {"$wbEncrypted": 1, "envelope": "def"},
+                "sessionState": "ss",
+                "expiresAt": 1,
+                "domain": "www.workbuddy.cn",
+            },
+        }),
+        encoding="utf-8",
+    )
+    assert auth_manager.parse_auth_file(info) is None
+    meta = auth_manager._safe_auth_file_meta(info, set())
+    assert meta["valid"] is False
+    # The encrypted-envelope file must not be importable -- whether the reason
+    # mentions the envelope or the at-rest key recovery failure, it stays invalid.
+    assert "envelope" in repr(meta["reason"]) or "信封" in meta["reason"] or "at-rest" in meta["reason"]
+    assert db.list_accounts(provider="workbuddy") == []
+
+
+def test_import_update_path_survives_encrypted_envelope_fields(isolated_db, tmp_path):
+    """同 uid 走 update 分支时，dict 形 token 字段曾让 encrypt_secret 抛 AttributeError。"""
+    plain = tmp_path / "plain.info"
+    plain.write_text(
+        '{"account":{"uid":"u-1","nickname":"n"},"auth":{"accessToken":"tok","refreshToken":"ref"}}',
+        encoding="utf-8",
+    )
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(auth_manager, "candidate_auth_dirs", lambda auth_dir=None: [tmp_path])
+    monkeypatch.setattr(auth_manager, "find_auth_files", lambda auth_dir=None: [plain])
+    monkeypatch.setattr(
+        auth_manager,
+        "discover_auth_files",
+        lambda auth_dir=None: {
+            "dirs": [],
+            "files": [{"path": str(plain), "valid": True, "already_imported": False, "account_name": "n", "uid_masked": "u-1"}],
+            "file_count": 1,
+            "valid_count": 1,
+        },
+    )
+    preview = control_plane.discover("workbuddy")
+    assert control_plane.import_channel("workbuddy", preview["preview_token"], [str(plain)])["imported"] == 1
+    monkeypatch.undo()
+
+    # 第二次导入同一个 uid：token 变成加密信封，走 update 分支，必须能落地而不是 500。
+    plain.write_text(
+        json.dumps({
+            "account": {"uid": "u-1", "nickname": "n"},
+            "auth": {"accessToken": {"$wbEncrypted": 1, "envelope": "abc"}, "refreshToken": {"$wbEncrypted": 1, "envelope": "def"}},
+        }),
+        encoding="utf-8",
+    )
+    # parse_auth_file 现在拒绝加密信封，所以直接用 dict 形 patch 打 update_account，
+    # 验证 dict 不再让 _protect_account_data / sqlite 绑定崩溃。
+    db.update_account(1, {"access_token": {"$wbEncrypted": 1}, "refresh_token": {"$wbEncrypted": 1}, "uid": "u-1"})
+    row = db.get_account(1)
+    assert row["access_token"] == ""
+    assert row["refresh_token"] == ""
+    assert row["uid"] == "u-1"
+
+
+def test_encrypt_secret_ignores_non_string_values(isolated_db):
+    assert credential_crypto.encrypt_secret({"$wbEncrypted": 1}, isolated_db) == ""
+    assert credential_crypto.encrypt_secret(None, isolated_db) == ""
+    assert credential_crypto.is_encrypted({"$wbEncrypted": 1}) is False
+    encrypted = credential_crypto.encrypt_secret("plain", isolated_db)
+    assert credential_crypto.is_encrypted(encrypted) is True
+    assert credential_crypto.decrypt_secret(encrypted, isolated_db) == "plain"

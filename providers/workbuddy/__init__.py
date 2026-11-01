@@ -39,6 +39,9 @@ class WorkBuddyProvider:
         return auth_manager.pick_account(exclude_ids, provider=self.id)
 
     async def pick_account_with_fallback(self, exclude_ids: set[int] | None = None) -> Optional[dict]:
+        if auth_manager.pinned_for(self.id) is not None:
+            # A pinned hop owns exactly one account: never drift to a sibling.
+            return self.pick_account(exclude_ids)
         return await auth_manager.pick_account_with_fallback(exclude_ids, provider=self.id)
 
     async def has_usable_account(self) -> bool:

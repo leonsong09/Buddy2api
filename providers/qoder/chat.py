@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -11,7 +12,9 @@ import httpx
 
 import auth_manager
 import database as db
+import resource_sync
 from providers.qoder import cosy
+from providers.qoder import quota as qoder_quota
 from providers.qoder.constants import (
     CHAT_PATH,
     CHAT_QUERY,
@@ -339,7 +342,8 @@ def _log(channel, api_key_info, account, model_name, finish_reason, status_code,
                 "account_name": (account.get("name") or account.get("nickname")) if account else None,
                 "provider": channel,
                 "model": model_name,
-                "resolved_model": (api_key_info or {}).get("_resolved_model", ""),
+                "resolved_model": (api_key_info.get("_resolved_model")
+                                   if isinstance(api_key_info, dict) else None) or model_name,
                 "stream": 1,
                 "prompt_tokens": 0,
                 "completion_tokens": max(1, text_len // 4) if text_len else 0,
@@ -372,6 +376,90 @@ def _signed_request(account: dict, channel: str, raw: str) -> tuple[str, dict, b
     return url, headers, encoded
 
 
+# A request answered by an account whose credits are gone comes back as HTTP 400
+# with a business payload: the observed shape is ``{"code":"112","message":
+# "{\"pricingUrl\":\"...\"}"}`` — a code plus a link to the pricing page. Both
+# markers are accepted because the code is the brittle half (it is upstream's to
+# change) while the pricing link is hard to produce for any other reason.
+QUOTA_REFUSAL_CODES = frozenset({"112"})
+QUOTA_REFUSAL_MARKER = "pricingUrl"
+
+
+def is_quota_refusal(body: str) -> bool:
+    """True when an upstream error says "this account cannot pay any more"."""
+    text = (body or "").strip()
+    if not text:
+        return False
+    if QUOTA_REFUSAL_MARKER in text:
+        return True
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return str(payload.get("code") or "") in QUOTA_REFUSAL_CODES
+
+
+# How long the live quota read triggered by an upstream refusal may take before
+# we fall back to the zero that refusal already implies. The refusal *is* the
+# answer — this read only sharpens the number — so it must never hold the error
+# response open for long.
+QUOTA_REFUSAL_FETCH_TIMEOUT_SECONDS = 5.0
+
+
+async def _live_remaining(account: dict) -> float:
+    """Best-effort live quota read, as a number routing can cache.
+
+    Returns the measured balance when the upstream answered with one (0.0
+    included) and 0.0 in every other case: a timeout, a raised error, or a
+    reading that came back without a number. The caller only gets here because
+    the upstream already refused to serve this account, so "no usable answer" is
+    recorded as the zero that refusal described rather than as "unknown".
+    """
+    try:
+        snapshot = await asyncio.wait_for(
+            qoder_quota.fetch_quota(account), timeout=QUOTA_REFUSAL_FETCH_TIMEOUT_SECONDS
+        )
+    except Exception:
+        return 0.0
+    value = getattr(snapshot, "remaining", None)
+    if isinstance(value, bool) or value is None:
+        return 0.0
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+async def mark_quota_exhausted(channel: str, account: dict) -> None:
+    """Record what an upstream refusal told us about an account's quota.
+
+    An exhausted wallet otherwise looks like any other 400: a cooldown that
+    ``auth_manager`` caps at 300s, after which the account is handed the next
+    request and burns it the same way. So the refusal is written to the quota
+    cache the routing gate reads — and because a zero there never ages back into
+    "unknown" (see ``routing.quota_exhausted``), the account stays out of
+    rotation until the user refreshes it by hand.
+
+    One real reading is attempted first (bounded by
+    ``QUOTA_REFUSAL_FETCH_TIMEOUT_SECONDS``): the refusal says "no quota" and a
+    live number says exactly how much is left, which is what the accounts page
+    should show. Best-effort throughout — a slow or failing read falls back to
+    ``remaining=0.0`` and nothing here can change the error the caller is
+    already returning.
+    """
+    remaining = await _live_remaining(account)
+    try:
+        resource_sync.store_quota_reading(
+            account,
+            remaining=remaining,
+            source=f"{channel}-upstream-quota",
+        )
+    except Exception:
+        pass
+
+
 async def _stream(channel: str, raw: str, model: str, api_key_info, model_name) -> AsyncGenerator[bytes, None]:
     tried: set[int] = set()
     last = "没有可用的 Qoder 账号"
@@ -402,6 +490,8 @@ async def _stream(channel: str, raw: str, model: str, api_key_info, model_name) 
                         if response.status_code >= 400:
                             last = (await response.aread()).decode("utf-8", errors="replace")[:240]
                             auth_manager.mark_account_failure(account["id"], response.status_code)
+                            if response.status_code == 400 and is_quota_refusal(last):
+                                await mark_quota_exhausted(channel, account)
                             _log(channel, api_key_info, account, shown, "error", response.status_code, last, started, 0)
                             break
                         text_len = 0
@@ -431,8 +521,12 @@ async def _stream(channel: str, raw: str, model: str, api_key_info, model_name) 
             except Exception as exc:
                 last = str(exc)[:240]
                 break
-    yield _openai_chunk(shown, last)
-    yield _openai_chunk(shown, finish="stop")
+    err = json.dumps(
+        {"error": {"message": last, "type": "channel_unavailable",
+                   "code": "channel_unavailable", "channel": channel}},
+        ensure_ascii=False,
+    )
+    yield f"data: {err}\n\n".encode("utf-8")
     yield b"data: [DONE]\n\n"
 
 

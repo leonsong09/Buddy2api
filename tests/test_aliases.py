@@ -10,7 +10,6 @@ import database as db
 import providers
 import router
 import server
-from providers.protocol import UnknownModel
 
 
 @pytest.fixture()
@@ -81,48 +80,35 @@ def test_user_alias_takes_effect_on_matching_channel_key(isolated_db, all_channe
     assert workbuddy.accepts_model("my-wb")
     assert workbuddy.translate_model("my-wb") == "glm-5.2"
 
-    bound = router.bind({"model": "gpt-4o"}, {"default_channel": "traework"})
-    assert bound.channel == "traework"
-    assert bound.inner == "gpt-4o"
-    assert traework.translate_model(bound.inner) == "qwen-3.7-plus"
+    assert router.admit_model({"default_channel": "traework"}, "gpt-4o") == "gpt-4o"
+    assert traework.translate_model("gpt-4o") == "qwen-3.7-plus"
 
-    bound = router.bind({"model": "gpt-4o"}, {"default_channel": "qwenwork"})
-    assert bound.channel == "qwenwork"
-    assert qwenwork.translate_model(bound.inner) == "pro"
+    assert router.admit_model({"default_channel": "qwenwork"}, "gpt-4o") == "gpt-4o"
+    assert qwenwork.translate_model("gpt-4o") == "pro"
 
-    bound = router.bind({"model": "gpt-4o"}, {"default_channel": "workbuddy"})
-    assert bound.channel == "workbuddy"
-    assert workbuddy.translate_model(bound.inner) == "glm-5.2"
+    assert router.admit_model({"default_channel": "workbuddy"}, "gpt-4o") == "gpt-4o"
+    assert workbuddy.translate_model("gpt-4o") == "glm-5.2"
 
-    bound = router.bind({"model": "traework/gpt-4o"}, {"default_channel": "traework"})
-    assert bound.inner == "gpt-4o"
+    assert router.admit_model({"default_channel": "traework"}, "traework/gpt-4o") == "gpt-4o"
 
-    with pytest.raises(UnknownModel):
-        router.bind({"model": "my-wb"}, {"default_channel": "traework"})
+    # "my-wb" is a workbuddy alias, so a traework-bound key cannot reach it.
+    with pytest.raises(HTTPException) as err:
+        router.admit_model({"default_channel": "traework"}, "my-wb")
+    assert err.value.detail["error"]["code"] == "unknown_model"
 
 
 def test_key_allowed_models_accepts_channel_alias_translation(isolated_db, all_channels):
     aliases.save_user_aliases({"traework": {"gpt-4o": "qwen-3.7-plus"}})
-    server._check_model_access(
-        {"allowed_models": ["qwen-3.7-plus"]},
-        "gpt-4o",
-        "gpt-4o",
-        "traework",
-    )
-    server._check_model_access(
-        {"allowed_models": ["traework/qwen-3.7-plus"]},
-        "gpt-4o",
-        "gpt-4o",
-        "traework",
-    )
+    assert router.admit_model(
+        {"default_channel": "traework", "allowed_models": ["qwen-3.7-plus"]}, "gpt-4o"
+    ) == "gpt-4o"
+    assert router.admit_model(
+        {"default_channel": "traework", "allowed_models": ["traework/qwen-3.7-plus"]}, "gpt-4o"
+    ) == "gpt-4o"
     with pytest.raises(HTTPException) as err:
-        server._check_model_access(
-            {"allowed_models": ["glm-5.2"]},
-            "gpt-4o",
-            "gpt-4o",
-            "traework",
-        )
-    assert err.value.status_code == 403
+        router.admit_model({"default_channel": "traework", "allowed_models": ["glm-5.2"]}, "gpt-4o")
+    assert err.value.status_code == 400
+    assert err.value.detail["error"]["code"] == "model_not_allowed"
 
 
 def test_alias_snapshot_lists_enabled_channels(isolated_db, all_channels):
@@ -182,15 +168,15 @@ def test_any_channel_uses_highest_account_priority(isolated_db, all_channels, mo
     wb = db.add_account({"name": "wb", "uid": "wb", "provider": "workbuddy", "priority": 1})
     tw = db.add_account({"name": "tw", "uid": "tw", "provider": "traework", "priority": 10})
     db.add_account({"name": "disabled", "uid": "disabled", "provider": "workbuddy", "priority": 100, "status": "inactive"})
-    assert router.bind({"model": model}, {"default_channel": "*"}).channel == "traework"
+    assert router.account_queue(model, {"default_channel": "*"})[0][0] == "traework"
     # Explicit prefixes and channel-bound keys keep their binding.
-    assert router.bind({"model": "workbuddy/" + model}, {"default_channel": "*"}).channel == "workbuddy"
-    assert router.bind({"model": model}, {"default_channel": "workbuddy"}).channel == "workbuddy"
+    assert router.account_queue("workbuddy/" + model, {"default_channel": "*"})[0][0] == "workbuddy"
+    assert router.account_queue(model, {"default_channel": "workbuddy"})[0][0] == "workbuddy"
     db.update_account(tw, {"priority": 1})
-    assert router.bind({"model": model}, {"default_channel": "*"}).channel == "workbuddy"
+    assert router.account_queue(model, {"default_channel": "*"})[0][0] == "workbuddy"
     db.update_account(wb, {"priority": -2})
     db.update_account(tw, {"priority": -1})
-    assert router.bind({"model": model}, {"default_channel": "*"}).channel == "traework"
+    assert router.account_queue(model, {"default_channel": "*"})[0][0] == "traework"
 
 
 @pytest.mark.parametrize("responses_api", [False, True])
@@ -210,10 +196,9 @@ def test_dispatch_logs_alias_and_resolved_model(isolated_db, all_channels, monke
                          "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]})
 
     monkeypatch.setattr(providers.get_provider("traework"), "chat_completions", send)
-    bound = router.bind({"model": "traework/test-alias"}, key)
-    handler = router.responses_after_bind if responses_api else router.chat_after_bind
-    payload = {"model": bound.original, "input": "ping"} if responses_api else {"model": bound.original, "messages": [{"role": "user", "content": "ping"}]}
-    result = asyncio.run(handler(bound, payload, key))
+    handler = router.responses_after_name if responses_api else router.chat_after_name
+    payload = {"model": "traework/test-alias", "input": "ping"} if responses_api else {"model": "traework/test-alias", "messages": [{"role": "user", "content": "ping"}]}
+    result = asyncio.run(handler("traework/test-alias", payload, key))
     assert result[1]["model"] == "traework/test-alias"
     row = db.search_logs({"q": "qwen-3.7-plus"})["items"][0]
     assert row["model"] == "traework/test-alias"

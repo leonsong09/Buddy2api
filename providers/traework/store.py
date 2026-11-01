@@ -24,11 +24,23 @@ def _roaming_dir() -> Path:
     return Path(os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming"))
 
 
+# The official installer has shipped several roaming folder names. Older builds
+# used "TRAE SOLO CN"; current builds create "Trae CN". Probe the known variants
+# before falling back, otherwise discovery reports exists=False on a machine that
+# is in fact logged in.
+_USER_DATA_CANDIDATES = ("Trae CN", "TRAE SOLO CN", "Trae SOLO CN", "TRAE CN")
+
+
 def traework_user_data_dir() -> Path:
     override = os.environ.get("CB_TRAEWORK_USER_DATA_DIR", "").strip()
     if override:
         return Path(override).expanduser()
-    return _roaming_dir() / "TRAE SOLO CN"
+    base = _roaming_dir()
+    for name in _USER_DATA_CANDIDATES:
+        candidate = base / name
+        if candidate.is_dir():
+            return candidate
+    return base / "TRAE SOLO CN"
 
 
 def traework_auth_dirs() -> list[Path]:
@@ -41,8 +53,9 @@ def traework_auth_dirs() -> list[Path]:
         dirs.append(Path(user_override).expanduser() / "User" / "globalStorage")
     else:
         roaming = _roaming_dir()
+        # Both the legacy "TRAE SOLO CN" and the newer "Trae CN" install folders
+        # may hold the same storage.json.
         dirs.append(roaming / "TRAE SOLO CN" / "User" / "globalStorage")
-        # Newer Trae CN installs keep the same storage.json here.
         dirs.append(roaming / "Trae CN" / "User" / "globalStorage")
     seen: set[str] = set()
     out: list[Path] = []
