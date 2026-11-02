@@ -6,6 +6,11 @@ import pytest
 import auth_manager as auth
 
 
+@pytest.fixture(autouse=True)
+def isolated_backend(monkeypatch):
+    monkeypatch.setattr(auth, "backend_url", lambda account: "https://checkin.example")
+
+
 @pytest.mark.parametrize("claim", [False, True])
 @pytest.mark.parametrize("status,body,content_type,expected", [
     (200, "", "application/json", "空响应"),
