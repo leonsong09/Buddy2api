@@ -205,28 +205,17 @@ def _bad_model(message: str, kind: str) -> HTTPException:
     )
 
 
-def _name_variants(name: str, prefix: str | None, base: str, candidates: list[str]) -> set[str]:
-    """Every spelling a whitelist may have stored for this request.
-
-    A whitelist entry is a name a human typed into a box, so it may be the
-    bare id, the namespaced id, or some channel's translation of it. Match
-    all of them; rejecting because the operator stored the translation instead
-    of the alias is not a rule anyone can remember.
-    """
-    variants = {name, base}
-    if prefix is None and candidates:
-        variants.add(f"{candidates[0]}/{base}")
-    for channel in candidates:
-        provider = providers.get_provider(channel)
-        if provider is None:
-            continue
-        try:
-            translated = provider.translate_model(base)
-        except Exception:
-            continue
-        variants.add(translated)
-        variants.add(f"{channel}/{translated}")
-    return variants
+def _model_allowed(api_key_info: dict | None, channel: str, base: str) -> bool:
+    """Evaluate permissions for this hop, not the union of all translations."""
+    allowed = (api_key_info or {}).get("allowed_models")
+    if not allowed:
+        return True
+    provider = providers.get_provider(channel)
+    if provider is None:
+        return False
+    translated = provider.translate_model(base)
+    variants = {base, translated, f"{channel}/{base}", f"{channel}/{translated}"}
+    return not set(allowed).isdisjoint(variants)
 
 
 def admit_model(api_key_info: dict | None, name) -> str:
@@ -295,7 +284,7 @@ def admit_model(api_key_info: dict | None, name) -> str:
 
     allowed = (api_key_info or {}).get("allowed_models")
     if allowed:
-        if set(allowed).isdisjoint(_name_variants(name, prefix, base, candidates)):
+        if not any(_model_allowed(api_key_info, channel, base) for channel in candidates):
             raise _bad_model(
                 f"Model '{name}' not allowed for this API key",
                 "model_not_allowed",
@@ -557,10 +546,13 @@ async def _replay(first: list, rest, account: dict | None = None) -> object:
             yield chunk
         return
     with auth_manager.pinned_account(account):
-        for chunk in first:
-            yield chunk
-        async for chunk in rest:
-            yield chunk
+        try:
+            for chunk in first:
+                yield chunk
+            async for chunk in rest:
+                yield chunk
+        finally:
+            await _close_stream(rest, account)
 
 
 def account_queue(name: str | None = None, api_key_info: dict | None = None
@@ -576,7 +568,8 @@ def account_queue(name: str | None = None, api_key_info: dict | None = None
       2. drop the accounts whose catalog does not serve this model id: a
          namespaced id matches its own channel only, a bare id every channel
          that recognizes it, and a key bound to one channel never leaves it;
-      3. order what is left: priority DESC -> channel order -> id, fixed (expiry
+      3. order what is left: priority DESC -> channel order -> weight DESC,
+         sticky account, historical request count, then id (expiry
          no longer orders anything — it is display-only, see
          ``routing.urgency_days``);
       4. hand the list to the dispatcher, which walks it one account at a time.
@@ -607,6 +600,8 @@ def account_queue(name: str | None = None, api_key_info: dict | None = None
                 continue
             if name and not _channel_accepts(channel, base):
                 continue
+            if name and not _model_allowed(api_key_info, channel, base):
+                continue
             if providers.get_provider(channel) is None:
                 continue
             for account in routing.channel_pool(channel):
@@ -617,12 +612,17 @@ def account_queue(name: str | None = None, api_key_info: dict | None = None
     if not rows:
         return rows
 
+    preferred = {channel: auth_manager.preferred_account_id(channel) for channel in order}
+
     def queue_key(row: tuple[str, dict]) -> tuple:
         channel, account = row
+        account_key = routing.sort_key(account, channel)
         return (
-            -routing.priority_of(account),
+            account_key[0],
             rank.get(channel, len(order)),
-            int(account.get("id") or 0),
+            account_key[1],
+            0 if preferred.get(channel) == int(account.get("id") or 0) else 1,
+            *account_key[2:],
         )
 
     rows.sort(key=queue_key)
@@ -648,6 +648,28 @@ def _clean_name(name) -> str:
     return name or "auto"
 
 
+async def _request_queue(name: str, api_key_info: dict | None) -> list[tuple[str, dict]]:
+    queue = account_queue(name, api_key_info)
+    if queue:
+        return queue
+    # Preserve the old recovery path: when no active account can serve, give
+    # expired credentials on permitted channels a chance to refresh first.
+    prefix, base = _namespaced(name)
+    for channel in _visible_channels(api_key_info):
+        if prefix is not None and prefix != channel:
+            continue
+        if not _channel_accepts(channel, base) or not _model_allowed(api_key_info, channel, base):
+            continue
+        try:
+            expired = any(a.get("status") == "expired" for a in db.list_accounts(provider=channel))
+            provider = providers.get_provider(channel)
+            if expired and provider is not None:
+                await provider.pick_account_with_fallback()
+        except Exception:
+            continue
+    return account_queue(name, api_key_info)
+
+
 async def chat_after_name(
     name: str, payload: dict, api_key_info: dict | None, after_queue=None
 ) -> tuple:
@@ -671,12 +693,29 @@ async def chat_after_name(
     # A provider picks its account lazily, inside the stream it returns, so the
     # 放行 exemption has to outlive this function rather than sit in a ``with``.
     routing.note_quota_exempt(_quota_exempt_channels(base))
-    queue = account_queue(name, api_key_info)
+    queue = await _request_queue(name, api_key_info)
     if not queue:
         return _no_account_error()
     if after_queue is not None:
         await after_queue(queue)
 
+    return await _walk_account_queue(name, payload, api_key_info, queue)
+
+
+async def _close_stream(stream, account: dict) -> None:
+    close = getattr(stream, "aclose", None)
+    if close is not None:
+        try:
+            with auth_manager.pinned_account(account):
+                await close()
+        except Exception:
+            pass
+
+
+async def _walk_account_queue(name: str, payload: dict, api_key_info: dict | None,
+                              queue: list[tuple[str, dict]]) -> tuple:
+    """Shared Chat/Responses failover; admission and daily reservation run once."""
+    _, base = _namespaced(name)
     if not _cross_channel_failover_enabled():
         bound = BindResult(channel=queue[0][0], inner=base, original=name)
         result = await _chat_after_bind_no_echo(bound, payload, api_key_info)
@@ -691,36 +730,36 @@ async def chat_after_name(
         # per-account rows the providers already write.
         hop = _hop_label((channel, account))
         sub = BindResult(channel=channel, inner=base, original=name)
+        stream = None
         try:
             with auth_manager.pinned_account(account):
                 result = await _chat_after_bind_no_echo(sub, payload, api_key_info)
+                if result[0] == "stream":
+                    stream = result[1]
+                    is_error, first, rest = await _stream_first_is_error(stream)
         except Exception as exc:  # a broken hop must not end the walk
+            if stream is not None:
+                await _close_stream(stream, account)
             result = ("error", (502, {
                 "error": {"message": str(exc)[:200] or "dispatch failed",
                           "type": "upstream_error", "code": "upstream_error",
                           "channel": channel}}))
         kind = result[0]
         if kind == "json":
+            auth_manager.note_dispatched_account(account)
             return await echo_original(result, name)
         if kind == "error":
             last_error = result
             continue
         if kind == "stream":
-            with auth_manager.pinned_account(account):
-                is_error, first, rest = await _stream_first_is_error(result[1])
             if is_error:
                 last_error = ("error", (502, {
                     "error": {"message": f"account '{hop}' failed",
                               "type": "channel_unavailable", "code": "channel_unavailable",
                               "channel": channel}}))
-                # Close out the abandoned stream.
-                try:
-                    with auth_manager.pinned_account(account):
-                        async for _ in rest:
-                            pass
-                except Exception:
-                    pass
+                await _close_stream(rest, account)
                 continue
+            auth_manager.note_dispatched_account(account)
             return ("stream", _rewrite_stream_model(_replay(first, rest, account), name))
     if last_error is not None:
         return last_error
@@ -750,31 +789,24 @@ async def _chat_after_bind_no_echo(
 async def responses_after_name(
     name: str, payload: dict, api_key_info: dict | None, after_queue=None
 ) -> tuple:
-    """Bridge Responses through the first hop's channel — one pool, no queue walk.
-
-    The bridge redispatches the chat handler after a context trim, so it owns
-    one channel and lets that provider retry inside its own pool, exactly what
-    the old bound-channel bridge did; the cross-channel walk is the chat
-    endpoint's, not this one's. The queue is still consulted for the admission
-    contract: an empty queue is the same 503 as chat returns, and the daily
-    quota (``after_queue``) is only spent when an account exists to serve.
-    """
+    """Bridge Responses through the same per-account queue as Chat."""
     name = _clean_name(name)
     _, base = _namespaced(name)
     routing.note_quota_exempt(_quota_exempt_channels(base))
-    queue = account_queue(name, api_key_info)
+    queue = await _request_queue(name, api_key_info)
     if not queue:
         return _no_account_error()
     if after_queue is not None:
         await after_queue(queue)
     channel = queue[0][0]
     if api_key_info and api_key_info.get("client_type") == "codex":
-        payload = trim_codex_prompt(payload, channel, base)
-    bound = BindResult(channel=channel, inner=base, original=name)
+        provider = providers.get_provider(channel)
+        resolved = provider.translate_model(base) if provider else base
+        payload = trim_codex_prompt(payload, channel, resolved)
     dispatch = dispatch_payload(payload, base)
 
     async def chat_handler(chat_payload: dict, _api_key_info: dict | None) -> tuple:
-        return await _chat_after_bind_no_echo(bound, chat_payload, api_key_info)
+        return await _walk_account_queue(name, chat_payload, api_key_info, queue)
 
     result = await responses.proxy_responses(
         dispatch,

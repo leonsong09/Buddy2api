@@ -276,17 +276,19 @@ def test_queue_orders_by_account_priority_across_channels(monkeypatch):
         workbuddy=[_account("workbuddy", 1, priority=0), _account("workbuddy", 2, priority=0)],
         loomy=[_account("loomy", 3, priority=9)],
     )
-    assert router.admit_model({"default_channel": "*"}, "deepseek-v4.1-flash-1017") == "deepseek-v4.1-flash-1017"
+    assert router.admit_model({"default_channel": "*"}, "auto") == "auto"
     # loomy's single account outranks both workbuddy accounts, so the walk enters
     # loomy first even though workbuddy leads the configured channel order.
-    assert [channel for channel, _row in router.account_queue("deepseek-v4.1-flash-1017", {"default_channel": "*"})] == [
+    assert [channel for channel, _row in router.account_queue("auto", {"default_channel": "*"})] == [
         "loomy",
         "workbuddy",
         "workbuddy",
     ]
 
 
-def test_a_leftover_factor_setting_cannot_move_the_queue(qwen_enabled, monkeypatch):
+def test_a_leftover_factor_setting_cannot_move_the_queue(qwen_enabled, monkeypatch, tmp_path):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "gateway.db")
+    db.init_db()
     """The switches are gone; their settings row must be dead data."""
     _pool(
         monkeypatch,

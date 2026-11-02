@@ -1,33 +1,9 @@
-"""Fill-first account routing.
+"""Account routing with explicit priority, channel precedence and weight.
 
-The pool is spent exhaustively, not shared proportionally: the account that is
-most urgent to use (highest ``priority``, then the configured channel order) is
-used until its quota runs out, and only then does the next account take over.
-
-That is why nothing here divides traffic into relative shares. A relative
-share has to be re-tuned the moment the group changes (add one account and
-everybody else's percentage silently drops), which is exactly the maintenance
-burden this module removes: how much an account is given depends only on that
-account's own quota and priority, never on who else is in the pool.
-
-Pipeline implemented here (and nowhere else)::
-
-    gate:   enabled channel, status='active', not cooling down,
-            quota not provably exhausted (a zero reading is proof, full stop,
-            unless the model is marked 放行 on that channel: a model that costs
-            nothing cannot be blocked by a balance of zero), can serve the model
-    order:  priority DESC -> channel order -> id (fixed: there is no switch
-            left to turn a factor off, because a half-disabled order is one
-            the page cannot describe and the operator cannot predict)
-    readings: expiry (``urgency_days``) is still computed for the management
-            page, but it no longer takes part in the order at all
-
-Everything is fail-open. A missing quota reading means "unknown", never "dead":
-taking a whole channel offline because one billing call failed is worse than
-spending a credit we did not know we had. A zero reading is different: it is a
-measurement, and it stays one. Nothing here ages it back into "unknown" — a zero
-account waits for the user's own refresh to write a new number, which is exactly
-what "0 means no quota" means to the person operating the pool.
+User preferences may keep traffic on one account; rate and expiry readings are
+for display only and never force redistribution. Measured zero quota removes
+an account until a positive reading is stored, without disabling check-in.
+Unknown quota remains eligible; free models may bypass only the quota gate.
 """
 
 from __future__ import annotations
@@ -67,17 +43,14 @@ DEFAULT_CHANNEL_URGENCY: dict[str, float] = {
 }
 
 DEFAULT_SETTINGS = {
-    # A single account is never asked to absorb the whole stream: once it hits
-    # either ceiling it sinks to the end of its own priority tier and a peer
-    # takes the next request.
+    # Legacy diagnostic settings, retained for API compatibility only.
     "routing_account_rpm": 60,
     "routing_account_inflight": 4,
     # Requests started within this window count as "still in flight". Providers
     # do not report completion back to the router, so concurrency is measured
     # as a short recent-arrival window instead of a paired acquire/release.
     "routing_inflight_window_seconds": 15,
-    # An account whose remaining quota falls below this share of its observed
-    # peak sinks within its priority tier; at zero it leaves the pool entirely.
+    # This threshold labels low balances for display; it never demotes accounts.
     "routing_low_watermark_pct": 5.0,
     # Per-channel urgency overrides, e.g. {"xiaohuanxiong": 0.5}.
     "routing_channel_urgency": {},
@@ -458,27 +431,26 @@ def priority_of(account: dict) -> int:
         return 0
 
 
+def weight_of(account: dict) -> int:
+    try:
+        return max(1, int(account.get("weight") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
 def sort_key(account: dict, channel: Optional[str] = None):
-    """Fill-first order: priority tier, then id.
+    """Preserve account priority/weight preference, without forced rotation.
 
-    Priority is a hard tier; inside one tier the id decides. That is the whole
-    account key. The channel order is applied one level above, in
-    ``router.account_queue``, which is the one place several channels are
-    compared at once.
-
-    Nothing here reads a setting. The order is fixed: a factor that can be
-    switched off half-way produces an order the management page cannot describe
-    and the operator cannot predict, and it silently disagreed with the rank the
-    page shows.
-
-    Expiry is deliberately absent: the upstream quota reading is neither fresh
-    nor reliable (see ``urgency_days``), so it is shown to the operator but never
-    orders anything.
-
-    ``channel`` is accepted for callers that still pass it, but no key depends on
-    it.
+    The caller inserts channel precedence after priority. Expiry, rate readings
+    and low balances never override the operator's preference for an account.
     """
-    return (-priority_of(account), int(account.get("id") or 0))
+    weight = weight_of(account)
+    try:
+        requests = max(0, int(account.get("total_requests") or 0))
+    except (TypeError, ValueError):
+        requests = 0
+    return (-priority_of(account), -weight, requests / weight,
+            requests, int(account.get("id") or 0))
 
 
 def order_accounts(accounts: list[dict], channel: Optional[str] = None) -> list[dict]:
@@ -523,6 +495,7 @@ def static_order_index(
         return (
             -priority_of(account),
             position.get(str(account.get("provider") or ""), tail),
+            -weight_of(account),
             int(account.get("id") or 0),
         )
 

@@ -1180,13 +1180,7 @@ def _route_weight(account: dict) -> int:
 
 
 def _route_sort_key(account: dict):
-    """Fill-first order — see routing.sort_key for the full explanation.
-
-    ``weight`` no longer takes part: traffic is spent exhaustively per account
-    (highest priority first, then the soonest-expiring quota), so a change to
-    the group never invalidates anybody's settings. This delegates to
-    routing.py so the picker and the management-page preview cannot drift.
-    """
+    """Share priority and weight preference with the routing preview."""
     return routing.sort_key(account, account.get("provider"))
 
 
@@ -1275,7 +1269,7 @@ def pick_account(
         sticky_id = _sticky_account_id.get(provider)
         if sticky_id is not None:
             sticky = next((a for a in top_candidates if a["id"] == sticky_id), None)
-            if sticky:  # rate limits no longer steer routing; keep the sticky account as-is
+            if sticky and routing.weight_of(sticky) == max(routing.weight_of(a) for a in top_candidates):
                 routing.note_pick(sticky["id"])
                 return sticky
 
@@ -1283,6 +1277,17 @@ def pick_account(
         _sticky_account_id[provider] = chosen["id"]
         routing.note_pick(chosen["id"])
         return chosen
+
+
+def preferred_account_id(provider: str) -> int | None:
+    """Snapshot the sticky preference; callers still enforce priority/weight."""
+    with _route_lock:
+        return _sticky_account_id.get(provider)
+
+
+def note_dispatched_account(account: dict) -> None:
+    with _route_lock:
+        _sticky_account_id[str(account.get("provider") or "workbuddy")] = int(account["id"])
 
 
 async def pick_account_with_fallback(

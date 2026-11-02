@@ -264,7 +264,7 @@ def test_the_id_is_the_only_final_tie_break(no_channel_override, monkeypatch):
     monkeypatch.setattr(routing, "resource_snapshot", lambda a: {})
     assert _order([_account(7), _account(3), _account(5)]) == [3, 5, 7]
     # Priority 0 then the id — nothing else sits behind them.
-    assert routing.sort_key(_account(3), "workbuddy") == (0, 3)
+    assert routing.sort_key(_account(3), "workbuddy") == (0, -1, 0.0, 0, 3)
     # order_accounts gates on availability, which no setting touches.
     assert [a["id"] for a in routing.order_accounts([_account(7), _account(3)])] == [3, 7]
 

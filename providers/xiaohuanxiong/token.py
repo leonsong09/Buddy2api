@@ -91,7 +91,9 @@ async def probe_token(token: str) -> bool:
     except httpx.HTTPError:
         # A network blip must not be reported as a dead login.
         return True
-    return response.status_code < 400
+    # Only an explicit authentication rejection proves the session is dead.
+    # Billing outages, rate limiting and other failures must not expire it.
+    return response.status_code not in {401, 403}
 
 
 async def refresh_account(account: dict) -> dict:
@@ -163,7 +165,7 @@ def resync_from_disk(account: dict) -> dict | None:
     Returns the patched account, or None when nothing usable was found on disk.
     """
     account_id = int(account.get("id") or 0)
-    if account_id and _resync_cache.get(account_id):
+    if account_id and _resync_cache.get(account_id, 0) > time.time():
         return None
     if account_id:
         _resync_cache[account_id] = time.time() + _RESYNC_TTL_SECONDS

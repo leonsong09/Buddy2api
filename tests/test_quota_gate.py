@@ -320,7 +320,7 @@ def test_quota_refusal_detection():
     assert qoder_chat.is_quota_refusal("") is False
 
 
-def test_upstream_refusal_falls_back_to_zero_when_the_read_fails(isolated_db, monkeypatch):
+def test_upstream_refusal_does_not_invent_zero_when_the_read_fails(isolated_db, monkeypatch):
     account = _new_account()
 
     async def boom(row):
@@ -330,12 +330,11 @@ def test_upstream_refusal_falls_back_to_zero_when_the_read_fails(isolated_db, mo
     asyncio.run(qoder_chat.mark_quota_exhausted("qoder", account))
 
     cached = routing.resource_snapshot(account)
-    assert cached["remaining"] == 0.0
-    assert cached["source"] == "qoder-upstream-quota"
-    assert routing.quota_exhausted(account) is True
+    assert cached == {}
+    assert routing.quota_exhausted(account) is False
 
 
-def test_upstream_refusal_falls_back_to_zero_on_a_slow_read(isolated_db, monkeypatch):
+def test_upstream_refusal_does_not_invent_zero_on_a_slow_read(isolated_db, monkeypatch):
     account = _new_account()
 
     async def slow(row):
@@ -347,8 +346,8 @@ def test_upstream_refusal_falls_back_to_zero_on_a_slow_read(isolated_db, monkeyp
     asyncio.run(qoder_chat.mark_quota_exhausted("qoder", account))
     # The refusal is already the answer: the bounded read must not hold it open.
     assert time.monotonic() - started < 1.0
-    assert routing.resource_snapshot(account)["remaining"] == 0.0
-    assert routing.quota_exhausted(account) is True
+    assert routing.resource_snapshot(account) == {}
+    assert routing.quota_exhausted(account) is False
 
 
 def test_upstream_refusal_caches_the_live_reading(isolated_db, monkeypatch):
@@ -402,7 +401,7 @@ def test_upstream_refusal_caches_a_measured_zero(isolated_db, monkeypatch):
     assert routing.quota_exhausted(account) is True
 
 
-def test_upstream_refusal_without_a_number_falls_back_to_zero(isolated_db, monkeypatch):
+def test_upstream_refusal_without_a_number_preserves_unknown(isolated_db, monkeypatch):
     account = _new_account()
 
     class Snapshot:
@@ -421,8 +420,8 @@ def test_upstream_refusal_without_a_number_falls_back_to_zero(isolated_db, monke
     monkeypatch.setattr(qoder_quota, "fetch_quota", read)
     asyncio.run(qoder_chat.mark_quota_exhausted("qoder", account))
 
-    assert routing.resource_snapshot(account)["remaining"] == 0.0
-    assert routing.quota_exhausted(account) is True
+    assert routing.resource_snapshot(account) == {}
+    assert routing.quota_exhausted(account) is False
 
 
 def test_upstream_refusal_without_an_account_id_is_a_no_op(isolated_db):

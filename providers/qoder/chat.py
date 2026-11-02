@@ -408,48 +408,40 @@ def is_quota_refusal(body: str) -> bool:
 QUOTA_REFUSAL_FETCH_TIMEOUT_SECONDS = 5.0
 
 
-async def _live_remaining(account: dict) -> float:
+async def _live_remaining(account: dict) -> float | None:
     """Best-effort live quota read, as a number routing can cache.
 
-    Returns the measured balance when the upstream answered with one (0.0
-    included) and 0.0 in every other case: a timeout, a raised error, or a
-    reading that came back without a number. The caller only gets here because
-    the upstream already refused to serve this account, so "no usable answer" is
-    recorded as the zero that refusal described rather than as "unknown".
+    Return only a measured total credit balance. A timeout or billing failure
+    is unknown, not a measured zero; normal account cooldown handles refusals.
     """
     try:
         snapshot = await asyncio.wait_for(
             qoder_quota.fetch_quota(account), timeout=QUOTA_REFUSAL_FETCH_TIMEOUT_SECONDS
         )
     except Exception:
-        return 0.0
+        return None
+    if not getattr(snapshot, "ok", False) or getattr(snapshot, "unsupported", False):
+        return None
+    if getattr(snapshot, "unit", None) != "credit":
+        return None
     value = getattr(snapshot, "remaining", None)
     if isinstance(value, bool) or value is None:
-        return 0.0
+        return None
     try:
         return max(0.0, float(value))
     except (TypeError, ValueError):
-        return 0.0
+        return None
 
 
 async def mark_quota_exhausted(channel: str, account: dict) -> None:
-    """Record what an upstream refusal told us about an account's quota.
+    """After a refusal, cache only a successfully measured total balance.
 
-    An exhausted wallet otherwise looks like any other 400: a cooldown that
-    ``auth_manager`` caps at 300s, after which the account is handed the next
-    request and burns it the same way. So the refusal is written to the quota
-    cache the routing gate reads — and because a zero there never ages back into
-    "unknown" (see ``routing.quota_exhausted``), the account stays out of
-    rotation until the user refreshes it by hand.
-
-    One real reading is attempted first (bounded by
-    ``QUOTA_REFUSAL_FETCH_TIMEOUT_SECONDS``): the refusal says "no quota" and a
-    live number says exactly how much is left, which is what the accounts page
-    should show. Best-effort throughout — a slow or failing read falls back to
-    ``remaining=0.0`` and nothing here can change the error the caller is
-    already returning.
+    A billing outage preserves the previous observation. Refusal cooldown and
+    queue failover handle the current failure without inventing a zero balance.
     """
     remaining = await _live_remaining(account)
+    if remaining is None:
+        return
     try:
         resource_sync.store_quota_reading(
             account,
