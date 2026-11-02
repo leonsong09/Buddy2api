@@ -43,42 +43,23 @@ class CheckinUnsupported(Exception):
     """Channel has no daily check-in claim API."""
 
 
-class ChannelUnavailable(Exception):
-    def __init__(self, channel: str, message: str = ""):
-        self.channel = channel
-        super().__init__(message or f"No usable accounts for channel '{channel}'")
-
-
 class UnknownChannel(Exception):
     def __init__(self, channel: str, message: str = ""):
         self.channel = channel
         super().__init__(message or f"Unknown or disabled channel '{channel}'")
 
 
-class InvalidModel(Exception):
-    def __init__(self, model: str, message: str = ""):
-        self.model = model
-        super().__init__(message or f"Invalid model '{model}'")
-
-
-class UnknownModel(Exception):
-    def __init__(self, model: str, message: str = ""):
-        self.model = model
-        super().__init__(message or f"Unknown model '{model}'")
-
-
-class KeyChannelMismatch(Exception):
-    def __init__(self, channel: str, key_channel: str, message: str = ""):
-        self.channel = channel
-        self.key_channel = key_channel
-        super().__init__(
-            message
-            or f"API key is bound to '{key_channel}', not '{channel}'"
-        )
-
-
 @dataclass(frozen=True)
 class BindResult:
+    """One dispatch hop: which channel serves, and what it is asked for.
+
+    ``original`` is the model id the client sent (logged as ``model``),
+    ``inner`` the bare id the channel's catalog is keyed by, and ``channel``
+    the provider that will translate and spend an account. The name carries no
+    routing weight any more — admission already judged it — so a hop is purely
+    descriptive.
+    """
+
     channel: ChannelId
     inner: str
     original: str

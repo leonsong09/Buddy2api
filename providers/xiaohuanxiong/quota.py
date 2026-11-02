@@ -9,7 +9,12 @@ import httpx
 from providers.protocol import QuotaSnapshot
 from providers.xiaohuanxiong.constants import CHANNEL_ID, ORIGIN, POINTS_BASE
 from providers.xiaohuanxiong.headers import client_headers
-from providers.xiaohuanxiong.token import XiaohuanxiongAuthError, is_token_expired, refresh_account
+from providers.xiaohuanxiong.token import (
+    XiaohuanxiongAuthError,
+    ensure_ready,
+    is_token_expired,
+    refresh_account,
+)
 
 
 def _number(value) -> float | None:
@@ -113,9 +118,7 @@ async def _get(url: str, token: str) -> tuple[int, dict]:
 
 
 async def _ensure(account: dict) -> dict:
-    if is_token_expired(account) or not account.get("access_token"):
-        return await refresh_account(account)
-    return account
+    return await ensure_ready(account)
 
 
 async def fetch_quota(account: dict) -> QuotaSnapshot:
@@ -177,7 +180,7 @@ async def fetch_checkin(account: dict, force: bool = False) -> dict:
 
 async def claim_checkin(account: dict) -> dict:
     try:
-        account = await refresh_account(account) if account.get("refresh_token") else await _ensure(account)
+        account = await ensure_ready(account)
         before = _today_points(await _bills(account))
         status, payload = await _get(
             f"{ORIGIN}/api/web/office/v3/setting_info",

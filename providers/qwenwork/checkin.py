@@ -26,6 +26,7 @@ from providers.qwenwork.token import QwenWorkAuthError, is_token_expired, refres
 
 SHANGHAI = timezone(timedelta(hours=8))
 NOT_ISSUED_MESSAGE = "今日每日积分尚未到账。千问办公在 0 点按官方登录会话发放，网关不能代领。"
+WALLET_EXPIRE_SOURCE = "qwenwork-wallet"
 
 
 def parse_daily_credit_notice(payload) -> dict:
@@ -103,6 +104,28 @@ def daily_credit_balance(payload, now: datetime | None = None) -> float:
     return total
 
 
+def wallet_expiry(payload, now: datetime | None = None) -> float | None:
+    """The soonest wallet deadline still worth routing on, as a unix timestamp.
+
+    Wallets are the only place this channel reports a deadline: the daily bucket
+    expires at the next Shanghai midnight, longer packs carry their own
+    ``valid_to``. Wallets that are already expired or already spent are not
+    deadlines, so they are skipped.
+    """
+    moment = (now or datetime.now(SHANGHAI)).timestamp()
+    soonest = None
+    for row in _wallet_rows(payload):
+        expiry = _parse_time(row.get("valid_to") or row.get("validTo"))
+        if expiry is None or _positive_balance(row.get("balance")) <= 0:
+            continue
+        stamp = expiry.timestamp()
+        if stamp <= moment:
+            continue
+        if soonest is None or stamp < soonest:
+            soonest = stamp
+    return soonest
+
+
 def _row(
     account: dict,
     *,
@@ -113,8 +136,10 @@ def _row(
     already_claimed: bool = False,
     credit: float = 0,
     no_campaign: bool = False,
+    next_expire_ts: float | None = None,
+    expire_source: str = "",
 ) -> dict:
-    return {
+    row = {
         "account_id": account.get("id"),
         "account_name": account.get("nickname") or account.get("name") or str(account.get("id")),
         "ok": ok,
@@ -129,6 +154,11 @@ def _row(
         "today_credit": credit,
         "channel": CHANNEL_ID,
     }
+    if next_expire_ts:
+        # Callers persist this; the row keeps its old shape when nothing is known.
+        row["next_expire_ts"] = next_expire_ts
+        row["expire_source"] = expire_source
+    return row
 
 
 def _remember(account: dict, result: dict) -> dict:
@@ -205,6 +235,9 @@ async def _get_wallets(account: dict) -> tuple[int, dict, str]:
 
 def _from_wallets(account: dict, status: int, payload: dict) -> dict:
     credit = daily_credit_balance(payload)
+    # Reported even when the daily bucket is missing: a long-lived pack keeps
+    # its own valid_to, and that is a routing deadline too.
+    expires = wallet_expiry(payload)
     if credit > 0:
         return _row(
             account,
@@ -213,6 +246,8 @@ def _from_wallets(account: dict, status: int, payload: dict) -> dict:
             already_claimed=True,
             credit=credit,
             message=f"今日每日积分已到账 {credit:g}",
+            next_expire_ts=expires,
+            expire_source=WALLET_EXPIRE_SOURCE,
         )
     return _row(
         account,
@@ -220,6 +255,8 @@ def _from_wallets(account: dict, status: int, payload: dict) -> dict:
         status_code=status,
         no_campaign=True,
         message=NOT_ISSUED_MESSAGE,
+        next_expire_ts=expires,
+        expire_source=WALLET_EXPIRE_SOURCE,
     )
 
 

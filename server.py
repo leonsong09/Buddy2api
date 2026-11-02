@@ -30,7 +30,7 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, HTMLResponse
 from starlette.concurrency import run_in_threadpool
 
 import database as db
@@ -40,7 +40,9 @@ import proxy
 import responses
 import providers
 import router
+import routing
 import control_plane
+import resource_sync
 from providers.protocol import KNOWN_CHANNEL_IDS, KNOWN_CHANNEL_SET
 from providers.qclaw.store import default_guid, upsert_account as upsert_qclaw_account
 from reasoning_controls import (
@@ -283,20 +285,6 @@ def _validate_key_channel(channel: str) -> str:
     return value
 
 
-def _check_model_access(api_key_info: dict | None, original: str, inner: str, channel: str):
-    if not api_key_info or not api_key_info.get("allowed_models"):
-        return
-    provider = providers.get_provider(channel)
-    translated = provider.translate_model(inner) if provider else inner
-    allowed = set(api_key_info["allowed_models"])
-    candidates = {original, inner, translated, f"{channel}/{inner}", f"{channel}/{translated}"}
-    if allowed.isdisjoint(candidates):
-        raise HTTPException(
-            status_code=403,
-            detail={"error": {"message": f"Model '{original}' not allowed for this API key", "type": "invalid_request_error"}},
-        )
-
-
 async def _read_json(request: Request, *, allow_empty: bool = False):
     chunks = []
     size = 0
@@ -419,15 +407,24 @@ def collect_v1_models() -> list[dict]:
 
 
 def channels_with_login() -> set[str]:
+    """Channels the client catalog may advertise.
+
+    Shared judgment with the router: a channel is offered only when it is
+    enabled and holds at least one *active* account with a stored token.
+    Disabled (``inactive``) and expired accounts do not keep a channel alive.
+    """
     found = set()
     for account in db.list_accounts():
-        if str(account.get("access_token") or "").strip():
-            found.add(str(account.get("provider") or ""))
+        if str(account.get("status") or "") != "active":
+            continue
+        if not str(account.get("access_token") or "").strip():
+            continue
+        found.add(str(account.get("provider") or ""))
     return found
 
 
 def public_v1_models() -> list[dict]:
-    """Client catalog. A channel with no stored login is omitted."""
+    """Client catalog. A channel with no active account is omitted."""
     present = channels_with_login()
     return [item for item in collect_v1_models() if item.get("channel") in present]
 
@@ -464,12 +461,17 @@ async def chat_completions(
     except InvalidReasoningControl as exc:
         raise _invalid_reasoning_http(exc) from exc
 
-    bound = router.bind_http(payload, api_key_info)
-    _check_model_access(api_key_info, bound.original, bound.inner, bound.channel)
-    await router.ensure_usable(bound.channel)
-    await run_in_threadpool(_reserve_client_quota, api_key_info)
-
-    result = await router.chat_after_bind(bound, payload, api_key_info)
+    # The one admission gate: a name this key cannot use dies here with a 400
+    # and never touches the pool. The queue and the key's daily quota are spent
+    # inside the dispatcher, in that order, so a request that found no account
+    # is never counted against the key.
+    router.admit_model(api_key_info, payload.get("model"))
+    result = await router.chat_after_name(
+        payload.get("model"),
+        payload,
+        api_key_info,
+        after_queue=lambda queue: run_in_threadpool(_reserve_client_quota, api_key_info),
+    )
 
     if result[0] == "error":
         status, detail = result[1]
@@ -506,14 +508,16 @@ async def resp_responses(
         resolve_reasoning_control(payload, prefer_nested=True)
     except InvalidReasoningControl as exc:
         raise _invalid_reasoning_http(exc) from exc
-    bound = router.bind_http(payload, api_key_info)
-    _check_model_access(api_key_info, bound.original, bound.inner, bound.channel)
-    if api_key_info and api_key_info.get("client_type") == "codex":
-        payload = router.trim_codex_prompt(payload, bound.channel, bound.inner)
-    await router.ensure_usable(bound.channel)
-    await run_in_threadpool(_reserve_client_quota, api_key_info)
+    router.admit_model(api_key_info, payload.get("model"))
     try:
-        result = await router.responses_after_bind(bound, payload, api_key_info)
+        result = await router.responses_after_name(
+            payload.get("model"),
+            payload,
+            api_key_info,
+            after_queue=lambda queue: run_in_threadpool(_reserve_client_quota, api_key_info),
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
         sys.stderr.write(f"[responses] ERROR: {e}\n{traceback.format_exc()}\n")
@@ -584,10 +588,60 @@ async def admin_credit_summary(
 
 # --- Accounts ---
 
+def _global_rank_map() -> tuple[dict[int, int], dict[int, int]]:
+    """Execution ranks for every account the router could spend right now.
+
+    Computed from the router's own ordering and returned as
+    ``(rank_by_account, global_rank_by_account)``:
+
+      rank         position inside the account's own channel pool (1-based)
+      global_rank  position in the one routing queue (``router.account_queue``),
+                   i.e. priority first, then the configured channel order,
+                   numbered 1..N without a gap
+
+    An account that is not in any pool — expired, or a quota that is provably
+    used up — is absent from both maps, which the callers report as null. Both
+    admin endpoints share this one function so the page and the preview can
+    never disagree about a rank.
+    """
+    rank_by_account: dict[int, int] = {}
+    global_rank_by_account: dict[int, int] = {}
+    per_channel: dict[str, int] = {}
+    for position, (cid, account) in enumerate(router.account_queue(), start=1):
+        aid = int(account["id"])
+        per_channel[cid] = per_channel.get(cid, 0) + 1
+        rank_by_account[aid] = per_channel[cid]
+        global_rank_by_account[aid] = position
+    return rank_by_account, global_rank_by_account
+
+
+def _static_rank_map(accounts: list[dict] | None = None) -> dict[int, int]:
+    """A number for every account in the table, state-independent, never null.
+
+    The account list sorts; it does not route. An expired, disabled, cooling
+    down or out-of-quota account is still a row the operator reorders, so this
+    map reads the whole table and applies only the static keys (priority, the
+    configured channel order, id) — see ``routing.static_order_index``. It takes
+    the channel order from the router so "channel order" means the same list the
+    model-config page shows. ``accounts`` is the list the caller already read:
+    passing it in keeps the numbering tied to the very rows being served (and
+    saves a second read of the table).
+    """
+    if accounts is None:
+        accounts = db.list_accounts()
+    return routing.static_order_index(accounts, router._channel_order())
+
+
 @app.get("/admin/accounts")
 async def admin_list_accounts(authorization: str | None = Header(default=None)):
     _check_admin(authorization)
     accounts = db.list_accounts()
+    # The page only displays these ranks — it never re-sorts by its own copy of
+    # the keys, which is how the two drifted apart before. channel_rank is the
+    # third layer: the channel's position in the model-config order (0-based).
+    channel_rank = {cid: i for i, cid in enumerate(router._channel_order())}
+    account_rank, account_global_rank = _global_rank_map()
+    account_static_rank = _static_rank_map(accounts)
     result = []
     for a in accounts:
         s = auth_manager.get_account_status(a)
@@ -599,6 +653,38 @@ async def admin_list_accounts(authorization: str | None = Header(default=None)):
         s["priority"] = int(a.get("priority") or 0)
         s["credit_limit"] = float(a.get("credit_limit") or 0)
         s["provider"] = a.get("provider") or "workbuddy"
+        channel = a.get("provider") or "workbuddy"
+        # urgency_days: None means "automatic". The effective value and where it
+        # came from are both sent so the page can show an editable box with the
+        # default it is overriding.
+        raw_urgency = a.get("urgency_days")
+        aid = int(a.get("id") or 0)
+        s["urgency_days"] = None if raw_urgency in (None, "") else float(raw_urgency)
+        s["urgency_effective"] = round(routing.urgency_days(a, channel), 4)
+        s["urgency_source"] = routing.urgency_source(a, channel)
+        s["quota_state"] = routing.quota_state(a)
+        s["routing"] = {
+            "priority": int(a.get("priority") or 0),
+            "urgency_days": None if raw_urgency in (None, "") else float(raw_urgency),
+            "urgency_effective": round(routing.urgency_days(a, channel), 4),
+            "urgency_source": routing.urgency_source(a, channel),
+            "quota_state": routing.quota_state(a),
+            "remaining": routing.remaining_quota(a),
+            "rpm_used": routing.rpm_used(aid),
+            "rpm_cap": routing.account_rpm_cap(),
+            "inflight_cap": routing.account_inflight_cap(),
+            # rank: position inside its own channel; channel_rank: position of
+            # that channel in the model-config order; global_rank: position in
+            # the whole account pool across every channel that would be tried.
+            # All three null when the account is gated out entirely.
+            # static_rank: the table's own numbering over EVERY account — the
+            # operator's sort key, so it is never null and never moves when an
+            # account's state (or its quota) changes.
+            "rank": account_rank.get(aid),
+            "channel_rank": channel_rank.get(channel),
+            "global_rank": account_global_rank.get(aid),
+            "static_rank": account_static_rank.get(aid),
+        }
         result.append(s)
     return result
 
@@ -820,7 +906,7 @@ async def admin_update_account(
 ):
     _check_admin(authorization)
     data = await _read_json_object(request)
-    allowed = {"name", "status", "weight", "priority", "credit_limit", "credit_baseline"}
+    allowed = {"name", "status", "weight", "priority", "credit_limit", "credit_baseline", "urgency_days"}
     update_data = {k: data[k] for k in allowed if k in data}
     if "status" in update_data and update_data["status"] not in {"active", "inactive", "expired"}:
         raise HTTPException(status_code=400, detail="Invalid account status")
@@ -837,6 +923,17 @@ async def admin_update_account(
                 raise HTTPException(status_code=400, detail=f"{field} must be numeric")
     if "weight" in update_data and update_data["weight"] < 1:
         raise HTTPException(status_code=400, detail="weight must be at least 1")
+    if "urgency_days" in update_data:
+        # Empty string / null clears the override, so the automatic value applies
+        # again. This is the "reset" button next to the input box.
+        raw_urgency = update_data["urgency_days"]
+        if raw_urgency in (None, ""):
+            update_data["urgency_days"] = None
+        else:
+            try:
+                update_data["urgency_days"] = max(0.0, float(raw_urgency))
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="urgency_days must be numeric or empty")
     db.update_account(aid, update_data)
     return {"status": "ok"}
 
@@ -924,6 +1021,19 @@ async def admin_account_resources(
         remaining = getattr(snapshot, "remaining", None)
         unsupported = bool(getattr(snapshot, "unsupported", False))
         credit_remaining = remaining if unit == "credit" and not unsupported else None
+        if bool(getattr(snapshot, "ok", False)) and credit_remaining is not None:
+            # Route on what we just measured. Routing reads nothing but the
+            # cache, so a live "0 credits" report that never reaches it leaves
+            # the account sitting at rank #1 in its channel pool. Best effort:
+            # failing to cache a reading must not fail the report itself.
+            try:
+                resource_sync.store_quota_reading(
+                    account,
+                    remaining=credit_remaining,
+                    source=f"{channel}-quota-check",
+                )
+            except Exception:
+                pass
         packages = extra.get("packages") if isinstance(extra.get("packages"), list) else []
         return {
             "ok": bool(getattr(snapshot, "ok", False)),
@@ -1328,6 +1438,40 @@ async def admin_remove_catalog_model(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+_TRUE_FLAGS = {"1", "true", "yes", "on"}
+_FALSE_FLAGS = {"0", "false", "no", "off"}
+
+
+def _flag(value, field: str) -> bool:
+    """Read a JSON boolean, or the words people send instead of one."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in _TRUE_FLAGS:
+            return True
+        if token in _FALSE_FLAGS:
+            return False
+    raise HTTPException(status_code=400, detail=f"{field} must be a boolean")
+
+
+@app.post("/admin/models/exempt")
+async def admin_set_model_exempt(
+    request: Request,
+    authorization: str | None = Header(default=None),
+):
+    """Mark one model 放行: quota readings never keep its accounts out of routing."""
+    _check_admin(authorization)
+    data = await _read_json_object(request)
+    channel = str(data.get("channel") or "").strip()
+    model_id = str(data.get("id") or data.get("model") or "").strip()
+    exempt = _flag(data.get("exempt", True), "exempt")
+    try:
+        return catalog.set_exempt(channel, model_id, exempt)
+    except catalog.CatalogError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 # --- Codex 一键配置 ---
 
 @app.post("/admin/codex/setup")
@@ -1480,6 +1624,172 @@ async def admin_update_aliases(
     return {"status": "ok"}
 
 
+# --- Channel routing order ---
+
+@app.get("/admin/channel-order")
+async def admin_get_channel_order(authorization: str | None = Header(default=None)):
+    _check_admin(authorization)
+    import providers
+    import router
+
+    order = router._channel_order()
+    routable = set(router.routable_channel_ids())
+    rows = []
+    for cid in order:
+        provider = providers.get_provider(cid)
+        rows.append({
+            "id": cid,
+            "display_name": getattr(provider, "display_name", None) or cid,
+            "routable": cid in routable,
+        })
+    return {"order": order, "channels": rows}
+
+
+@app.put("/admin/channel-order")
+async def admin_update_channel_order(
+    request: Request,
+    authorization: str | None = Header(default=None),
+):
+    _check_admin(authorization)
+    import router
+
+    data = await _read_json_object(request)
+    raw = data.get("order")
+    if not isinstance(raw, list):
+        raise HTTPException(status_code=400, detail="order must be a list of channel ids")
+    normalized = router._normalize_channel_order([str(x) for x in raw])
+    db.set_setting("channel_order", normalized)
+    return {"status": "ok", "order": normalized}
+
+
+# --- Routing behaviour (caps, watermark, per-channel urgency) ---
+
+@app.get("/admin/routing-settings")
+async def admin_get_routing_settings(authorization: str | None = Header(default=None)):
+    _check_admin(authorization)
+    return {
+        "settings": routing.routing_settings(),
+        "defaults": dict(routing.DEFAULT_SETTINGS),
+        "channel_urgency": dict(routing.DEFAULT_CHANNEL_URGENCY),
+    }
+
+
+@app.put("/admin/routing-settings")
+async def admin_update_routing_settings(
+    request: Request,
+    authorization: str | None = Header(default=None),
+):
+    _check_admin(authorization)
+    data = await _read_json_object(request)
+    written: dict = {}
+
+    for key in ("routing_account_rpm", "routing_account_inflight"):
+        if key in data:
+            try:
+                value = max(0, int(float(data[key])))
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail=f"{key} must be numeric")
+            db.set_setting(key, value)
+            written[key] = value
+
+    if "routing_inflight_window_seconds" in data:
+        try:
+            window = max(1.0, float(data["routing_inflight_window_seconds"]))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="routing_inflight_window_seconds must be numeric")
+        db.set_setting("routing_inflight_window_seconds", window)
+        written["routing_inflight_window_seconds"] = window
+
+    if "routing_low_watermark_pct" in data:
+        try:
+            pct = max(0.0, min(100.0, float(data["routing_low_watermark_pct"])))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="routing_low_watermark_pct must be numeric")
+        db.set_setting("routing_low_watermark_pct", pct)
+        written["routing_low_watermark_pct"] = pct
+
+    if "routing_channel_urgency" in data:
+        raw_map = data["routing_channel_urgency"]
+        if not isinstance(raw_map, dict):
+            raise HTTPException(status_code=400, detail="routing_channel_urgency must be an object")
+        clean: dict[str, float] = {}
+        for cid, value in raw_map.items():
+            if value in (None, ""):
+                continue
+            try:
+                clean[str(cid)] = max(0.0, float(value))
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail=f"urgency for {cid} must be numeric")
+        db.set_setting("routing_channel_urgency", clean)
+        written["routing_channel_urgency"] = clean
+
+    return {"status": "ok", "settings": routing.routing_settings(), "written": written}
+
+
+@app.get("/admin/routing-plan")
+async def admin_routing_plan(
+    model: str | None = None,
+    channel: str | None = None,
+    authorization: str | None = Header(default=None),
+):
+    """Show the exact queue a request would walk — computed once, here.
+
+    The page never re-sorts anything: this returns the same
+    ``router.account_queue`` list the dispatcher walks, grouped per channel so
+    it stays readable. Each block carries ``try_order`` (1-based position of the
+    channel in that queue) and ``channel_rank`` (0-based position in the
+    model-config order); each account row carries the same ``global_rank`` the
+    accounts page shows.
+    """
+    _check_admin(authorization)
+    requested = (model or "").strip()
+    key_info = {"default_channel": channel} if channel else None
+    queue = router.account_queue(requested or None, key_info)
+    ordered_channels: list[str] = []
+    by_channel: dict[str, list[dict]] = {}
+    for cid, account in queue:
+        if cid not in by_channel:
+            by_channel[cid] = []
+            ordered_channels.append(cid)
+        by_channel[cid].append(account)
+
+    if not ordered_channels and requested:
+        # Nothing can be spent right now; still report the channels that know
+        # this model so the page can explain why the queue is empty. Once the
+        # caller names a channel, only that channel can be the answer.
+        prefix, base = router._namespaced(requested)
+        known = [prefix] if prefix else router._channels_for_name(base)
+        if channel:
+            known = [cid for cid in known if cid == channel]
+        ordered_channels = known
+
+    channel_rank = {cid: i for i, cid in enumerate(router._channel_order())}
+    _, account_global_rank = _global_rank_map()
+    plans = []
+    for try_order, cid in enumerate(ordered_channels, start=1):
+        provider = providers.get_provider(cid)
+        routed = []
+        for index, account in enumerate(by_channel.get(cid) or [], start=1):
+            row = routing.describe_account(account, index, cid)
+            row["name"] = account.get("name") or row["name"]
+            row["global_rank"] = account_global_rank.get(int(account["id"]))
+            routed.append(row)
+        plans.append({
+            "channel": cid,
+            "display_name": getattr(provider, "display_name", None) or cid,
+            # try_order: where this channel sits in the queue (1-based).
+            # channel_rank: its position in the model-config order (0-based).
+            "try_order": try_order,
+            "channel_rank": channel_rank.get(cid),
+            "accounts": routed,
+        })
+    return {
+        "model": requested or None,
+        "channels": plans,
+        "settings": routing.routing_settings(),
+    }
+
+
 # ============================================================
 # Web UI
 # ============================================================
@@ -1497,6 +1807,17 @@ async def index(request: Request):
         headers={"Cache-Control": "no-store", "Content-Security-Policy": "frame-ancestors 'none'"},
     )
     return response
+
+
+@app.get("/web/vendor/{filename}")
+async def web_vendor(filename: str):
+    """本地前端依赖（Vue）。jsdelivr 等境外 CDN 在国内网络下会被重置连接，改成本地文件。"""
+    if filename != "vue.global.prod.min.js":
+        raise HTTPException(status_code=404, detail="not found")
+    path = WEB_DIR / "vendor" / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="vendor asset missing")
+    return FileResponse(path, media_type="text/javascript", headers={"Cache-Control": "public, max-age=86400"})
 
 
 # ============================================================

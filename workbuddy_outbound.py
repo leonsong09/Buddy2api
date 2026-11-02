@@ -27,10 +27,29 @@ _TERMINAL_CLIENT = {
 # Exact strings the WorkBuddy channel check matches. One-word changes keep the
 # meaning and miss the exact match. 11128 is matched as text, so a user message
 # that contains that number is rewritten too.
+#
+# Upstream returns 11128 ("Illegal API invocation from an unapproved channel")
+# when it spots third-party client fingerprints in the conversation. The known
+# high-weight markers are the literal phrase "You are Claude Code", the word
+# "Anthropic", and the identity wording "DeepSeek Harness" — any of these alone
+# trips the weighted check. The naive rewrites below kept the "You are Claude
+# Code" substring (only swapping a word after it) and never touched "Anthropic"
+# or the case/period variants of "DeepSeek Harness", so the markers survived.
+# These replacements remove those substrings entirely. The "DeepSeek Harness"
+# identity mark is handled by _DS_IDENTITY_RE (case/period-insensitive, only in
+# an agent-identity framing) so innocent mentions are left untouched.
 _REWRITES = (
     (
         "You are Claude Code, Anthropic's official CLI for Claude",
-        "You are Claude Code, Anthropic's official CLI tool for Claude",
+        "You are an AI coding assistant using the provider's official CLI tool",
+    ),
+    (
+        "You are Claude Code",
+        "You are an AI coding assistant",
+    ),
+    (
+        "Anthropic",
+        "the provider",
     ),
     (
         "Main branch (you will usually use this for PRs)",
@@ -48,16 +67,13 @@ _REWRITES = (
         "Sisyphus-Junior - Focused executor from OhMyOpenCode",
         "Sisyphus-Junior - Focused executor from Oh My OpenCode",
     ),
-    (
-        "You are an AI agent powered by DeepSeek Harness.",
-        "You are an AI agent powered by DeepSeek's Harness.",
-    ),
     ("11128", "11-128"),
 )
 _NEEDLES = (
     "x-anthropic-billing-header",
     "cc_entrypoint=",
     "You are Claude Code",
+    "Anthropic",
     "Main branch (",
     "You are a coding agent running in the Codex CLI",
     "You are an AI agent powered by DeepSeek Harness",
@@ -67,6 +83,19 @@ _NEEDLES = (
 )
 _HEADER_RE = re.compile(r"(?i)x-anthropic-billing-header:[^;\n]*;?\s*")
 _KV_RE = re.compile(r"(?i)\bcc_[a-z0-9_]+=[^;\n]*;?\s*")
+# Agent-identity framing of the DeepSeek Harness persona. Upstream's 11128 check
+# only fires on the canonical persona sentence (e.g. "You are an AI agent powered
+# by DeepSeek Harness."); a plain model mention ("The DeepSeek Harness model ...")
+# is harmless. This regex requires an identity prefix so mentions are left alone,
+# and is case-insensitive with an optional trailing period to cover the client
+# phrasings that upstream's check also rejects (capitalized, no period, etc.).
+_DS_IDENTITY_RE = re.compile(
+    r"(?i)(?:"
+    r"you are |i am |this is |"
+    r"an ai agent powered by |an ai agent created by |"
+    r"a large language model powered by |powered by "
+    r")deepseek\s+harness\.?"
+)
 
 
 def fingerprints_enabled() -> bool:
@@ -350,7 +379,7 @@ def _sanitize_content(content):
 def _looks_marked(text: str) -> bool:
     if any(needle in text for needle in _NEEDLES):
         return True
-    return _HEADER_RE.search(text) is not None
+    return _HEADER_RE.search(text) is not None or _DS_IDENTITY_RE.search(text) is not None
 
 
 def _sanitize_text(text: str) -> str:
@@ -358,6 +387,12 @@ def _sanitize_text(text: str) -> str:
         return text
     for old, new in _REWRITES:
         text = text.replace(old, new)
+    # The DeepSeek Harness identity mark (the literal agent persona string used
+    # by this project and by DeepSeek-authored client prompts) trips upstream's
+    # channel check at 11128. Strip it case-insensitively and regardless of a
+    # trailing period, but only in an agent-identity framing — a bare mention of
+    # the DeepSeek Harness model elsewhere in the conversation is left alone.
+    text = _DS_IDENTITY_RE.sub("the AI assistant", text)
     text = _HEADER_RE.sub("", text)
     if "cc_" in text.lower():
         previous = None

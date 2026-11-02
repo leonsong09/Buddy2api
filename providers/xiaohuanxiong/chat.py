@@ -12,7 +12,13 @@ import auth_manager
 import database as db
 from providers.xiaohuanxiong.constants import CHANNEL_ID, LLM_BASE, STATIC_MODELS
 from providers.xiaohuanxiong.headers import client_headers
-from providers.xiaohuanxiong.token import XiaohuanxiongAuthError, is_token_expired, refresh_account
+from providers.xiaohuanxiong.token import (
+    XiaohuanxiongAuthError,
+    ensure_ready,
+    is_token_expired,
+    refresh_account,
+    resync_from_disk,
+)
 
 RETRYABLE_STATUS = {401, 403, 408, 429, 500, 502, 503, 504}
 
@@ -47,7 +53,8 @@ def _log(api_key_info, account, model_name, stream, prompt_t, completion_t, tota
                 "account_name": account.get("name") if account else None,
                 "provider": CHANNEL_ID,
                 "model": model_name,
-                "resolved_model": (api_key_info or {}).get("_resolved_model", ""),
+                "resolved_model": (api_key_info.get("_resolved_model")
+                                   if isinstance(api_key_info, dict) else None) or model_name,
                 "stream": 1 if stream else 0,
                 "prompt_tokens": prompt_t,
                 "completion_tokens": completion_t,
@@ -82,9 +89,7 @@ def _body(payload: dict) -> tuple[dict, str]:
 
 
 async def _ready(account: dict) -> dict:
-    if not account.get("access_token") or is_token_expired(account):
-        return await refresh_account(account)
-    return account
+    return await ensure_ready(account)
 
 
 async def chat_completions(payload: dict, api_key_info: dict | None) -> tuple:
@@ -137,11 +142,16 @@ async def chat_completions(payload: dict, api_key_info: dict | None) -> tuple:
             )
             return ("json", data)
         status = response.status_code
-        if status in {401, 403} and attempt < max_attempts - 1:
+        if status in {401, 403} and attempt < 2:
+            # The desktop client never hands us a refresh_token, so a 401 usually
+            # means the user re-logged-in there and rotated the token. Re-read its
+            # auth.json before giving up on this account.
             try:
                 await refresh_account(account)
             except XiaohuanxiongAuthError:
-                pass
+                fresh = resync_from_disk(account)
+                if fresh and fresh.get("access_token"):
+                    account = fresh
         auth_manager.mark_account_failure(account["id"], status)
         text = response.text[:400]
         last_error = ("error", (status, _detail(response)))
@@ -195,6 +205,14 @@ async def _stream(raw: str, api_key_info, model_name: str) -> AsyncGenerator[byt
                                 response.status_code, text, t0, final=True,
                             )
                             return
+                        # No refresh_token for this channel: re-read the client's
+                        # auth.json and retry with the rotated token before
+                        # declaring this a transient failure.
+                        if response.status_code in {401, 403}:
+                            fresh = resync_from_disk(account)
+                            if fresh and fresh.get("access_token"):
+                                account = fresh
+                                continue
                         _log_failure(
                             api_key_info, account, model_name, True,
                             response.status_code, text, t0, final=False,

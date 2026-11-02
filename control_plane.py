@@ -14,6 +14,7 @@ from pathlib import Path
 import database as db
 import providers
 import auth_manager
+import resource_sync
 
 
 async def _gather_limited(accounts: list[dict], operation, limit: int = 2) -> list[dict]:
@@ -394,6 +395,21 @@ async def _summarize_workbuddy_credit(provider, accounts: list[dict], force: boo
     return row, resources
 
 
+def _cache_quota_reading(account, remaining) -> None:
+    """Best-effort: cache a measured quota balance so routing can gate on it.
+
+    A dashboard refresh is a real observation; dropping it on the floor is how a
+    dry account kept its slot in the pool. Never let a cache write break the
+    report, and never write a figure that was not measured.
+    """
+    if not isinstance(account, dict) or account.get("id") in (None, ""):
+        return
+    try:
+        resource_sync.store_quota_reading(account, remaining=float(remaining), source="dashboard-quota-check")
+    except Exception:
+        pass
+
+
 async def _summarize_quota_channel(channel: str, provider, accounts: list[dict]) -> dict:
     fetch_quota = getattr(provider, "fetch_quota", None) if provider else None
     if fetch_quota is None:
@@ -407,6 +423,11 @@ async def _summarize_quota_channel(channel: str, provider, accounts: list[dict])
             "unsupported": True,
             "message": "quota API not available",
         }
+    by_id = {
+        str(account.get("id")): account
+        for account in accounts
+        if isinstance(account, dict) and account.get("id") not in (None, "")
+    }
     snapshots = await _gather_limited(accounts, fetch_quota, limit=2)
     remaining_values = []
     used_values = []
@@ -437,6 +458,16 @@ async def _summarize_quota_channel(channel: str, provider, accounts: list[dict])
         if ok:
             ok_count += 1
         value = getattr(snapshot, "remaining", None) if not isinstance(snapshot, dict) else snapshot.get("remaining")
+        if value is not None and unit == "credit" and ok and not snap_unsupported:
+            # Let routing see what this dashboard just measured. Opening the
+            # overview is often the only quota check that ever runs, and the
+            # gate reads nothing but the cache. Best effort by design.
+            snap_account_id = (
+                getattr(snapshot, "account_id", None)
+                if not isinstance(snapshot, dict)
+                else snapshot.get("account_id")
+            )
+            _cache_quota_reading(by_id.get(str(snap_account_id)), value)
         if unit == channel_unit and value is not None and not snap_unsupported:
             remaining_values.append(float(value))
         if unit == "token" and not snap_unsupported:
@@ -549,6 +580,29 @@ def _workbuddy_family(channel: str) -> bool:
     return channel in {"workbuddy", "workbuddy-i"}
 
 
+def _store_checkin_expiry(account: dict, result) -> None:
+    """Cache a deadline a check-in response revealed, best effort.
+
+    Providers know the expiry ("valid_to", "benefit.validity.days") but only
+    report it in their result row; this is the one place that turns it into the
+    resource cache routing reads. A cache write must never fail a check-in, and
+    an absent deadline must not be invented.
+    """
+    if not isinstance(result, dict):
+        return
+    expires = result.get("next_expire_ts")
+    if not expires:
+        return
+    try:
+        resource_sync.store_quota_expiry(
+            account,
+            expires_at=expires,
+            source=str(result.get("expire_source") or ""),
+        )
+    except Exception:
+        pass
+
+
 async def checkin_status_one(account: dict, force: bool = False) -> dict:
     channel = str(account.get("provider") or "workbuddy")
     if not _workbuddy_family(channel):
@@ -561,6 +615,7 @@ async def checkin_status_one(account: dict, force: bool = False) -> dict:
         result = await fetch_fn(account, force=force)
         if isinstance(result, dict):
             result["channel"] = channel
+            _store_checkin_expiry(account, result)
         return result
     return await auth_manager.fetch_checkin_status(account, force=force)
 
@@ -577,6 +632,7 @@ async def claim_one(account: dict) -> dict:
         result = await claim_fn(account)
         if isinstance(result, dict):
             result["channel"] = channel
+            _store_checkin_expiry(account, result)
         return result
     result = await auth_manager.claim_daily_checkin(account)
     if result.get("ok"):
@@ -606,9 +662,11 @@ async def checkin_status_all(force: bool = False) -> dict:
                 lambda account: auth_manager.fetch_checkin_status(account, force=force),
                 limit=2,
             )
-        for item in chunk:
+        for account, item in zip(accounts, chunk):
             if isinstance(item, dict):
                 item["channel"] = channel
+                # _gather_limited preserves the account order, so rows line up.
+                _store_checkin_expiry(account, item)
         results.extend(chunk)
     return {
         "total": len(results),

@@ -72,12 +72,26 @@ btn,.btn{display:inline-flex;align-items:center;gap:5px;padding:6px 12px;border:
 .card{border:1px solid var(--border);border-radius:var(--r);margin-bottom:16px}
 .card-h{padding:12px 16px;border-bottom:1px solid var(--border2);font-weight:600;font-size:13px;display:flex;align-items:center;justify-content:space-between}
 .card-h .sub{font-weight:400;color:var(--fg3);font-size:12px}
+.rf-head{flex-wrap:wrap;row-gap:6px;column-gap:10px}
+.card-h.rf-head>span:first-child{min-width:0;display:flex;flex-wrap:wrap;align-items:baseline;gap:8px}
+.card-h.rf-head .sub{max-width:none;text-align:left}
+.rf-order{display:flex;align-items:center;gap:10px;margin-left:auto;flex-wrap:wrap;min-width:0}.rf-order .rf-note{font-size:13px;font-weight:700;color:var(--fg);white-space:nowrap;cursor:help;border-bottom:1px dashed var(--fg3);padding-bottom:1px;display:inline-flex;align-items:center;gap:5px}.rf-chain{display:inline-flex;align-items:center;gap:6px;font-size:12px;flex-wrap:wrap;min-width:0}.rf-chain .rf-step{cursor:help;border-bottom:1px dashed var(--fg3);padding-bottom:1px;white-space:nowrap}.rf-chain .rf-arrow{color:var(--fg3)}.rf-order .btn.s{white-space:nowrap}
 .card-p{padding:16px}
 
 /* table */
 table{width:100%;border-collapse:collapse;font-size:13px}
 .table-scroll{overflow-x:auto}
 .table-scroll table{min-width:1260px}
+/* 供应模型表只有 4 列，用较窄的下限：窄窗口横向滚动，避免粘性操作列盖住“说明” */
+.table-scroll.src-scroll table{min-width:840px}
+.src-row{cursor:grab;transition:background .12s}
+.src-row.dragging{opacity:.45;cursor:grabbing}
+.src-row.drag-over td{background:var(--accent-soft)}
+.src-row.drag-over td:first-child{position:relative;box-shadow:inset 0 2px 0 var(--accent)}
+.src-row.drag-over.drag-below td:first-child{box-shadow:inset 0 -2px 0 var(--accent)}
+.src-row td{cursor:inherit}
+.src-drag-hint{display:inline-flex;align-items:center;gap:5px;color:var(--fg3);font-weight:400;font-size:12px}
+.src-drag-hint svg{width:12px;height:12px;flex:none}
 th{text-align:left;padding:8px 16px;font-size:11px;font-weight:600;color:var(--fg3);border-bottom:1px solid var(--border);text-transform:uppercase;letter-spacing:.3px;white-space:nowrap}
 td{padding:10px 16px;border-bottom:1px solid var(--border2)}
 tr:last-child td{border-bottom:none}
@@ -157,6 +171,13 @@ badge,.badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;bord
 .numctl{width:64px;padding:5px 7px;border:1px solid var(--border);border-radius:4px;font:inherit;font-size:12px;background:var(--input)}
 .numctl.credit{width:76px}
 .numctl:focus{border-color:var(--blue);background:#fff;outline:none}
+.urgency-cell{min-width:132px}
+.th-note{font-weight:400;color:var(--fg3);font-size:11px;margin-left:4px}
+.urgency-row{display:flex;align-items:center;gap:4px}
+.urgency-row .numctl{width:58px}
+.rc-field{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--fg2)}
+.rc-field>span{font-weight:600;white-space:nowrap}
+.rc-field>em{font-style:normal;font-size:11px;color:var(--fg3);white-space:nowrap}
 .credit-cell{min-width:138px}
 .credit-main{display:flex;align-items:center;gap:6px;justify-content:space-between}
 .credit-rem{font-weight:700;font-family:var(--mono);font-size:12px}
@@ -168,6 +189,10 @@ badge,.badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;bord
 .official-val{font-weight:700;font-family:var(--mono);font-size:12px}
 .official-val.unset{font-weight:500;color:var(--fg3)}
 .official-meta{font-size:11px;color:var(--fg3);margin-top:4px;white-space:nowrap}
+.exp-grid{display:inline-grid;grid-template-columns:auto auto;gap:3px 8px;align-items:center;justify-items:start}
+.exp-val{font-weight:700;font-family:var(--mono);font-size:12px}
+.exp-days{font-size:11px;color:var(--fg3);white-space:nowrap}
+.exp-dash{color:var(--fg3);text-align:center;font-size:12px}
 .pkg-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:12px}
 .pkg-kpi{border:1px solid var(--border2);border-radius:4px;background:var(--input);padding:10px}
 .pkg-kpi .k{font-size:10px;color:var(--fg3);text-transform:uppercase;letter-spacing:.3px}
@@ -523,7 +548,7 @@ html[data-theme="gold"] .badge.err{background:#2a1414;color:#ffb4b4;border-color
 </head>
 <body>
 <div id="app"></div>
-<script src="https://cdn.jsdelivr.net/npm/vue@3.4.21/dist/vue.global.prod.min.js"></script>
+<script src="/web/vendor/vue.global.prod.min.js"></script>
 <script>
 const{createApp,ref,reactive,computed,onMounted,onUnmounted}=Vue;
 const I={
@@ -941,8 +966,8 @@ createApp({
 
     <div class="card">
       <div class="card-h">最近请求<span class="sub">最新 8 条</span></div>
-      <table class="mini-table" v-if="s.recent_logs?.length"><thead><tr><th>时间</th><th>Key</th><th>账号</th><th>模型</th><th>Token</th><th>Credit</th><th>耗时</th><th>结果</th></tr></thead><tbody>
-        <tr v-for="x in s.recent_logs" :key="x.id"><td class="mono">{{fmt(x.created_at)}}</td><td>{{x.api_key_name||'-'}}</td><td>{{x.account_name||'-'}}</td><td><code>{{x.model}}</code><template v-if="x.resolved_model&&x.resolved_model!==x.model"> → <span class="tag">{{x.provider}}</span> <code>{{x.resolved_model}}</code></template></td><td>{{tok(x.total_tokens)}}</td><td>{{money(x.credit)}}</td><td>{{ms(x.duration_ms)}}</td><td><span class="badge" :class="x.status_code===200&&x.finish_reason!=='error'?'ok':'err'">{{x.finish_reason||x.status_code}}</span></td></tr>
+      <table class="mini-table" v-if="s.recent_logs?.length"><thead><tr><th>时间</th><th>Key</th><th>账号</th><th>别名→实际模型</th><th>Token</th><th>Credit</th><th>耗时</th><th>结果</th></tr></thead><tbody>
+        <tr v-for="x in s.recent_logs" :key="x.id"><td class="mono">{{fmt(x.created_at)}}</td><td>{{x.api_key_name||'-'}}</td><td>{{x.account_name||'-'}}</td><td><code>{{x.model}}</code><template v-if="x.resolved_model && x.resolved_model!==x.model"> → <span class="tag">{{x.provider}}</span> <code>{{x.resolved_model}}</code></template></td><td>{{tok(x.total_tokens)}}</td><td>{{money(x.credit)}}</td><td>{{ms(x.duration_ms)}}</td><td><span class="badge" :class="x.status_code===200&&x.finish_reason!=='error'?'ok':'err'">{{x.finish_reason||x.status_code}}</span></td></tr>
       </tbody></table>
       <div class="empty" v-else>暂无请求记录</div>
     </div>
@@ -951,9 +976,9 @@ createApp({
 }).component('accs',{props:['token','toast'],setup(p){
   const l=ref([]),ld=ref(true),sa=ref(false),ai=ref(''),nm=ref(''),disc=ref(null),dl=ref(false),scanning=ref(false),adding=ref(false),authPath=ref(''),test=ref(null),claim=ref(null),pkg=ref(null),tl=ref(0),claimingAll=ref(false),officialRefreshing=ref(false),checkins=ref({}),checkinSummary=ref(null),checkinLoading=ref(false),busy=ref({}),discChannel=ref('workbuddy'),channels=ref([{id:'workbuddy',display_name:'WorkBuddy 国内版'},{id:'workbuddy-i',display_name:'WorkBuddy 国际版'},{id:'qwenwork',display_name:'QwenWork / 千问办公'},{id:'qoder',display_name:'Qoder 中国版'},{id:'qoder-i',display_name:'Qoder 国际版'},{id:'traework',display_name:'TraeWork'},{id:'loomy',display_name:'Loomy'},{id:'xiaohuanxiong',display_name:'小浣熊'}]),catalogs=ref({}),importSummary=ref([]),login=ref(null),loginRealm=ref('cn'),loginBusy=ref(false),keeping=ref(false),keep=ref(null),rowMenu=ref(0),rowMenuPos=ref({top:0,left:0});
   let loginPopup=null,loginTimer=null;
-  const filters=reactive({q:'',status:'all',claim:'all',sort:'priority'});
-  function hydrate(a){return {...a,_weight:a.weight||1,_priority:a.priority||0,_creditSnapshot:a.credit_snapshot||a.credit_limit||0,_baseWeight:a.weight||1,_basePriority:a.priority||0,_baseCreditSnapshot:a.credit_snapshot||a.credit_limit||0}}
-  function dirty(a){return Number(a._weight||1)!==Number(a._baseWeight||1)||Number(a._priority||0)!==Number(a._basePriority||0)||Number(a._creditSnapshot||0)!==Number(a._baseCreditSnapshot||0)}
+  const filters=reactive({q:'',status:'all',claim:'all',sort:'order'});
+  function hydrate(a){return {...a,_weight:a.weight||1,_baseWeight:a.weight||1,_priority:a.priority||0,_urgency:a.urgency_days??'',_creditSnapshot:a.credit_snapshot||a.credit_limit||0,_basePriority:a.priority||0,_baseUrgency:a.urgency_days??'',_baseCreditSnapshot:a.credit_snapshot||a.credit_limit||0}}
+  function dirty(a){return Number(a._weight||1)!==Number(a._baseWeight||1)||Number(a._priority||0)!==Number(a._basePriority||0)||String(a._urgency??'')!==String(a._baseUrgency??'')||Number(a._creditSnapshot||0)!==Number(a._baseCreditSnapshot||0)}
   function busyKey(id,k){return busy.value[id+'-'+k]}
   function mergeResource(a,r){if(!r)return;a.official_resource=r}
   function applyResourceResult(r){const a=l.value.find(x=>Number(x.id)===Number(r?.account_id));if(a)mergeResource(a,r)}
@@ -998,29 +1023,16 @@ createApp({
   function keepText(r){if(r.ok)return '已续期';if(r.skipped)return r.message||'已跳过';if(r.reason==='session_dead')return r.message||'登录失效';return r.message||'失败'}
   function claimOf(r){const rows=(keep.value&&keep.value.summary&&keep.value.summary.claim&&keep.value.summary.claim.results)||[];const hit=rows.find(x=>Number(x.account_id)===Number(r.account_id));return hit||{ok:true,skipped:true,message:'不支持领取'}}
   function refreshLife(a){if(!a.refresh_known)return '续期未知';if(a.refresh_expired)return '续期已过期';const h=Number(a.refresh_remaining_hours||0);if(h>=72)return '续期约 '+Math.floor(h/24)+' 天';if(h>=24)return '续期 '+Math.floor(h/24)+' 天';return '续期 '+h+'h'}
-  const savingAll=ref(false);
-  const dirtyAccounts=computed(()=>l.value.filter(dirty));
-  async function persistMeta(a){
-    const creditSnapshot=Math.max(0,Number(a._creditSnapshot)||0);
-    const body={weight:parseInt(a._weight)||1,priority:parseInt(a._priority)||0};
-    if(Number(a._creditSnapshot||0)!==Number(a._baseCreditSnapshot||0))body.credit_limit=creditSnapshot;
-    await api.put('/admin/accounts/'+a.id,body,p.token);
-    a.weight=body.weight;a.priority=body.priority;
-    a._baseWeight=body.weight;a._basePriority=body.priority;
-    if(body.credit_limit!==undefined){a._baseCreditSnapshot=creditSnapshot;a.credit_snapshot=creditSnapshot;a.credit_limit=creditSnapshot;a.credit_baseline=Number(a.total_credits)||0;a.credit_since_snapshot=0;a.credit_remaining=creditSnapshot;a.credit_used_pct=0}
-  }
-  async function saveMeta(a){if(savingAll.value||busyKey(a.id,'save'))return;await withBusy(a,'save',async()=>{try{await persistMeta(a);p.toast('已保存')}catch(e){p.toast(apiErr(e,'保存失败'),'err')}})}
-  async function saveAllMeta(){
-    if(savingAll.value)return;
-    const targets=dirtyAccounts.value.filter(a=>!busyKey(a.id,'save'));
-    if(!targets.length)return;
-    savingAll.value=true;
-    try{
-      const results=await Promise.allSettled(targets.map(a=>withBusy(a,'save',()=>persistMeta(a))));
-      const failed=results.filter(r=>r.status==='rejected').length;
-      p.toast('已保存 '+(targets.length-failed)+' 个账号'+(failed?'，'+failed+' 个失败，请重试':''),failed?'err':'ok');
-    }finally{savingAll.value=false}
-  }
+  async function putMeta(a){const creditSnapshot=Math.max(0,Number(a._creditSnapshot)||0);const body={priority:parseInt(a._priority)||0,weight:Math.max(1,parseInt(a._weight)||1)};if(Number(a._creditSnapshot||0)!==Number(a._baseCreditSnapshot||0))body.credit_limit=creditSnapshot;if(String(a._urgency??'')!==String(a._baseUrgency??''))body.urgency_days=String(a._urgency??'').trim()===''?null:Number(a._urgency);await api.put('/admin/accounts/'+a.id,body,p.token);a.weight=body.weight;a._baseWeight=body.weight;a._basePriority=parseInt(a._priority)||0;a._baseUrgency=a._urgency??'';a._baseCreditSnapshot=creditSnapshot;return body}
+  async function mergeRouting(){try{const rows=await api.get('/admin/accounts',p.token);const byId=new Map(rows.map(r=>[Number(r.id),r]));l.value.forEach(a=>{const r=byId.get(Number(a.id));if(r&&r.routing!==undefined)a.routing=r.routing})}catch(e){}}
+  async function saveMeta(a){await withBusy(a,'save',async()=>{try{const body=await putMeta(a);p.toast(body.credit_limit!==undefined?'已保存余额快照':'已保存','ok');await mergeRouting()}catch(e){p.toast(apiErr(e,'保存失败'),'err')}})}
+  const dirtyRows=computed(()=>l.value.filter(dirty));
+  const accountSaving=ref(false);
+  async function saveAllDirty(){if(accountSaving.value)return;const rows=dirtyRows.value.slice();if(!rows.length)return;accountSaving.value=true;let done=0;const failed=[];try{for(const a of rows){try{await putMeta(a);done+=1}catch(e){failed.push((a.nickname||a.name||('#'+a.id))+'：'+apiErr(e,'保存失败'))}}}finally{accountSaving.value=false}if(failed.length){p.toast(done+' 个成功，'+failed.length+' 个失败：'+failed.slice(0,3).join('；')+(failed.length>3?' 等 '+(failed.length-3)+' 条':''),'err');if(done)await mergeRouting()}else{p.toast('已保存 '+done+' 个账号','ok');await mergeRouting()}}
+  // Clears the manual override so the automatic value (channel default or the
+  // quota reading) applies again. Immediate — no separate save needed.
+  function canResetUrgency(a){return a.urgency_days!=null||String(a._urgency??'').trim()!==''}
+  async function resetUrgency(a){if(!canResetUrgency(a))return;if(a.urgency_days==null){a._urgency='';a._baseUrgency='';p.toast('已清空手动值，改回自动');return}try{await api.put('/admin/accounts/'+a.id,{urgency_days:null},p.token);a._urgency='';a._baseUrgency='';p.toast('已恢复自动值');await load()}catch(e){p.toast(apiErr(e,'重置失败'),'err')}}
   async function toggle(a){await withBusy(a,'toggle',async()=>{try{await api.put('/admin/accounts/'+a.id,{status:a.status==='active'?'inactive':'active'},p.token);p.toast(a.status==='active'?'已禁用':'已启用');await load()}catch(e){p.toast(apiErr(e,'操作失败'),'err')}})}
   async function loadCatalogs(){try{const snap=await api.get('/admin/models/catalogs',p.token);const map={};(snap.sources||[]).forEach(s=>{map[s.channel]=s.models||[]});catalogs.value=map}catch(e){}}
   function modelsFor(channel){const rows=catalogs.value[channel]||[];const out=[];const seen=new Set();function add(id,name){if(!id||seen.has(id))return;seen.add(id);out.push({id,name:name||id})}add('auto','auto（通道默认）');rows.forEach(x=>add(x.id,x.name||x.id));return out}
@@ -1047,10 +1059,19 @@ createApp({
   function officialMeta(a){const r=a.official_resource;if(!r)return '未刷新';if(r.unsupported)return officialUnit(a)==='token'?'无今日 token 数字':'无积分数字';if(!r.ok)return r.message||'加载失败';if(officialUnit(a)==='token')return '今日 token';if(!String(a.provider||'workbuddy').startsWith('workbuddy'))return r.message||'积分';return '30 天内到期 '+credit(r.expiring_30d_total)+' · '+(r.package_count||0)+' 包'+(r.stale?' · 旧缓存':'')}
   function cacheAge(a){const r=a.official_resource;if(!r)return '';const v=Number(r.age_seconds||0);if(v<60)return v+'s 前';if(v<3600)return Math.floor(v/60)+'m 前';return Math.floor(v/3600)+'h 前'}
   function officialWarn(a){return Number(a.official_resource?.expiring_30d_total||0)>0}
-  function checkinOf(a){return checkins.value[a.id]||null}
-  function checkinClass(a){const r=checkinOf(a);if(!r||r.no_campaign)return 'inactive';if(!r.ok)return 'err';if(r.claimed||r.already_claimed||r.today_checked_in)return r.stale?'warn':'ok';return 'warn'}
+  function checkinOf(a){return checkins.value[a.id]||null}  function checkinClass(a){const r=checkinOf(a);if(!r||r.no_campaign)return 'inactive';if(!r.ok)return 'err';if(r.claimed||r.already_claimed||r.today_checked_in)return r.stale?'warn':'ok';return 'warn'}
   function checkinText(a){const r=checkinOf(a);if(!r)return checkinLoading.value?'读取中':'未知';if(r.claimed)return '刚领 '+credit(r.credit);if(r.already_claimed||r.today_checked_in)return r.message||'今日已领';if(r.no_campaign)return r.message||'当前没有可领活动';if(!r.ok)return r.message||'失败';return r.message&&r.message!=='可领取'?r.message:'可领取'}
   function tokenLife(a){if(a.token_expired)return '过期';const h=Number(a.remaining_hours||0);if(h>=72)return '约 '+Math.floor(h/24)+' 天';if(h>=24)return Math.floor(h/24)+' 天 '+(h%24)+'h';return h+'h'}
+  // Everything below is display only — the numbers come from the backend.
+  function urgencyDays(a){const v=a.routing?.urgency_effective;if(v==null)return '-';if(Number(v)>=9999)return '-';if(Number(v)<1)return (Number(v)*24).toFixed(1)+' 小时';return Number(v).toFixed(Number(v)<10?1:0)+' 天'}
+  function urgencyLabel(a){const r=a.routing||{};if(r.urgency_days!=null)return '手动';if(r.urgency_source==='channel')return '通道默认';if(r.urgency_source==='daily')return '每日额度';if(r.urgency_source==='quota')return '官方数据';return '默认'}
+  // 「即将到期」列：loomy 等按日发放额度的通道，用后端算好的 urgency_effective 做午夜倒计时。
+  const URGENCY_DAILY_TITLE='每日赠送额度当天作废，按本地午夜重置倒计时；此列仅供人工参考，不参与路由顺序判定';
+  // 「即将到期」四格：上行左=积分、上行右=时间；下行左=最近到期的积分、下行右=天数。
+  function expDaysText(a){const v=a.official_resource?.next_expire_days;if(v==null||v==="")return "-";const n=Number(v);if(!Number.isFinite(n))return "-";if(n<=0)return "已过期";if(n<1)return (n*24).toFixed(1)+" 小时";return (Number.isInteger(n)?n:n.toFixed(1))+" 天"}
+  // 每日发放的通道没有到期包，只有按本地午夜重置：右侧显示下一次重置的时刻。
+  function resetClock(){const d=new Date();d.setHours(24,0,0,0);const p=x=>String(x).padStart(2,"0");return p(d.getMonth()+1)+"-"+p(d.getDate())+" "+p(d.getHours())+":"+p(d.getMinutes())}
+  function urgencyDailyText(a){const v=a.routing?.urgency_effective;if(v==null)return '—';const n=Number(v);if(!Number.isFinite(n)||n>=9999)return '—';if(n<1)return (n*24).toFixed(1)+' 小时';return n.toFixed(2)+' 天'}
   const visibleAccounts=computed(()=>{
     const q=filters.q.trim().toLowerCase();
     let rows=l.value.filter(a=>{
@@ -1069,7 +1090,16 @@ createApp({
       if(filters.sort==='used')return Number(b.total_credits||0)-Number(a.total_credits||0);
       if(filters.sort==='requests')return Number(b.total_requests||0)-Number(a.total_requests||0);
       if(filters.sort==='expire')return Number(a.official_resource?.next_expire_ts||9999999999)-Number(b.official_resource?.next_expire_ts||9999999999);
-      return Number(b.priority||0)-Number(a.priority||0)||Number(b.weight||1)-Number(a.weight||1)||Number(a.total_requests||0)/Math.max(1,Number(a.weight||1))-Number(b.total_requests||0)/Math.max(1,Number(b.weight||1));
+      // Default key 'order' = backend routing.static_rank: a STATUS-INDEPENDENT static
+      // position (priority first, then channel order). It is NOT a routing result — an
+      // account this round's router filtered out keeps its rank here, so the list never
+      // reshuffles because of account state. null (older backend) is the fallback and
+      // sorts last.
+      const ra=a.routing?.static_rank,rb=b.routing?.static_rank;
+      if(ra==null&&rb==null)return 0;
+      if(ra==null)return 1;
+      if(rb==null)return -1;
+      return Number(ra)-Number(rb);
     });
     return rows;
   })
@@ -1081,7 +1111,7 @@ createApp({
   function queueMenuClose(){setTimeout(closeRowMenu,0)}
   function toggleRowMenu(id,ev){if(rowMenu.value===id){closeRowMenu();return}const box=ev.currentTarget.getBoundingClientRect();const menuH=156,menuW=148;let top=box.bottom+4;if(top+menuH>window.innerHeight-8)top=Math.max(8,box.top-menuH-4);rowMenu.value=id;rowMenuPos.value={top,left:Math.max(8,box.right-menuW)}}
   function onDocClick(){closeRowMenu()}
-  onMounted(()=>{loadChannels();loadCatalogs();load(true);discover();document.addEventListener('click',onDocClick)});onUnmounted(()=>{closeLogin();document.removeEventListener('click',onDocClick)});return{l,visibleAccounts,filters,ld,sa,ai,nm,disc,dl,scanning,adding,authPath,test,testModels,claim,pkg,tl,claimingAll,officialRefreshing,checkins,checkinSummary,checkinLoading,busyKey,dirty,dirtyAccounts,savingAll,saveAllMeta,load,loadCheckins,discover,scan,importSummary,add,ref2,saveMeta,toggle,openTest,closeTest,runTest,claimOne,claimAll,keepaliveAll,refreshAllResources,openPackages,refreshPackages,del,fmt,size,credit,tok,creditPct,claimText,keepText,claimOf,officialBalance,officialHasValue,officialMain,officialMeta,cacheAge,officialWarn,checkinClass,checkinText,tokenLife,refreshLife,shortTime,expireText,pkgBadge,clearPath,I,discChannel,channels,login,loginRealm,loginBusy,keeping,keep,openLogin,startLogin,closeLogin,rowMenu,rowMenuPos,toggleRowMenu,closeRowMenu,queueMenuClose}
+  onMounted(()=>{loadChannels();loadCatalogs();load(true);discover();document.addEventListener('click',onDocClick)});onUnmounted(()=>{closeLogin();document.removeEventListener('click',onDocClick)});return{l,visibleAccounts,filters,ld,sa,ai,nm,disc,dl,scanning,adding,authPath,test,testModels,claim,pkg,tl,claimingAll,officialRefreshing,checkins,checkinSummary,checkinLoading,busyKey,dirty,load,loadCheckins,discover,scan,importSummary,add,ref2,saveMeta,putMeta,mergeRouting,dirtyRows,accountSaving,saveAllDirty,resetUrgency,canResetUrgency,toggle,openTest,closeTest,runTest,claimOne,claimAll,keepaliveAll,refreshAllResources,openPackages,refreshPackages,del,fmt,size,credit,tok,creditPct,claimText,keepText,claimOf,officialBalance,officialHasValue,officialMain,officialMeta,cacheAge,officialWarn,checkinClass,checkinText,tokenLife,urgencyDays,urgencyLabel,urgencyDailyText,expDaysText,resetClock,URGENCY_DAILY_TITLE,refreshLife,shortTime,expireText,pkgBadge,clearPath,I,discChannel,channels,login,loginRealm,loginBusy,keeping,keep,openLogin,startLogin,closeLogin,rowMenu,rowMenuPos,toggleRowMenu,closeRowMenu,queueMenuClose}
 },template:`
 <div>
   <div class="phead"><h1>账号管理</h1><p>浏览器登录 · 一键续期并领取 · 失败自动切换</p></div>
@@ -1092,7 +1122,7 @@ createApp({
         <div>
           <div class="detect-title" v-if="disc">检测到 {{disc.file_count}} 个登录文件，其中 {{disc.valid_count}} 个有效</div>
           <div class="detect-title" v-else>正在检测本机登录文件</div>
-          <div class="hint">全部导入会读取各启用通道的默认目录；当前通道导入可使用自定义路径。未登录的通道会跳过，已有账号保留权重和优先级。WorkBuddy 可点「浏览器登录」添加，不必先打开官方客户端。</div>
+          <div class="hint">全部导入会读取各启用通道的默认目录；当前通道导入可使用自定义路径。未登录的通道会跳过，已有账号保留优先级、权重和寿命设置。WorkBuddy 可点「浏览器登录」添加，不必先打开官方客户端。</div>
         </div>
         <div class="detect-actions">
           <div class="action-row">
@@ -1144,9 +1174,9 @@ createApp({
   <div class="callout" style="margin-bottom:12px">「一键续期并领取」会先续期登录，再领取今日积分。「一键领取今日积分」只领取。定时执行在设置页，默认关闭。每次结果留在设置页的自动化日志。</div>
   <div class="tbar account-tbar"><div class="account-actions"><div class="action-row"><button class="btn s" @click="load(true)" :disabled="ld||officialRefreshing"><span v-html="I.refresh"></span>{{ld?'刷新中':'刷新列表'}}</button><button class="btn s" @click="refreshAllResources()" :disabled="officialRefreshing||!l.some(a=>a.status==='active')">{{officialRefreshing?'刷新中':'刷新官方额度'}}</button><button class="btn s" @click="loadCheckins(true)" :disabled="checkinLoading">{{checkinLoading?'读取中':'刷新领取状态'}}</button></div><div class="action-row"><button class="btn s soft" @click="keepaliveAll" :disabled="keeping||claimingAll||!l.some(a=>a.status!=='inactive')">{{keeping?'处理中':'一键续期并领取'}}</button><button class="btn s pri" @click="claimAll" :disabled="claimingAll||keeping||!l.some(a=>a.status==='active')">{{claimingAll?'领取中':'一键领取今日积分'}}</button><button class="btn s" @click="sa=true"><span v-html="I.plus"></span>高级手动添加</button></div></div><div class="account-tbar-meta"><span class="tag" v-if="checkinSummary">可领 {{checkinSummary.available}} · 已领 {{checkinSummary.already_claimed}}</span><span class="tag" v-if="l.length">{{visibleAccounts.length}}/{{l.length}}个 · {{l.filter(a=>a.status==='active').length}}活跃</span></div></div>
   <div v-if="ld" class="load"><div class="spin"></div></div>
-  <div class="card" v-else-if="l.length"><div class="card-h">账号列表<span class="sub">同一列按通道单位展示；到期包仅 WorkBuddy</span></div><div class="card-p" style="padding-bottom:0"><div class="control-row"><input class="searchbox" v-model="filters.q" placeholder="搜索账号 / UID / 域名"/><select class="selectctl" v-model="filters.status"><option value="all">全部状态</option><option value="active">active</option><option value="inactive">inactive</option><option value="expired">expired</option></select><select class="selectctl" v-model="filters.claim"><option value="all">全部领取状态</option><option value="available">可领取</option><option value="claimed">今日已领</option><option value="failed">领取失败</option></select><select class="selectctl" v-model="filters.sort"><option value="priority">优先级 / 权重</option><option value="balance">官方余额高到低</option><option value="expire">最近到期优先</option><option value="requests">请求数高到低</option><option value="used">累计已用高到低</option></select><div class="spacer"></div><button class="btn s primary" @click="saveAllMeta" :disabled="savingAll||!dirtyAccounts.length">{{savingAll?'保存中…':'保存全部修改（'+dirtyAccounts.length+'）'}}</button><span class="tag">当前 {{visibleAccounts.length}} 条</span></div></div><div class="table-scroll"><table><thead><tr><th>账号</th><th>通道</th><th>UID</th><th>状态</th><th>今日领取</th><th>权重</th><th>优先级</th><th>官方余额</th><th>即将到期</th><th>本地估算</th><th>本地快照</th><th>Token 有效期</th><th>请求</th><th>Token</th><th>累计已用</th><th class="ops-head"></th></tr></thead><tbody>
-    <tr v-for="a in visibleAccounts" :key="a.id"><td style="font-weight:600">{{a.nickname||a.name}} <span class="tag warn" v-if="dirty(a)">未保存</span></td><td><span class="tag">{{a.provider||'workbuddy'}}</span></td><td class="mono">{{a.uid?.slice(0,8)}}…</td><td><span class="badge" :class="a.status">{{a.status}}</span></td><td><span class="badge" :class="checkinClass(a)">{{checkinText(a)}}</span><div class="cache-note" v-if="checkins[a.id]?.stale">旧缓存</div></td><td><input class="numctl" v-model.number="a._weight" type="number" min="1" max="100"/></td><td><input class="numctl" v-model.number="a._priority" type="number" min="-100" max="100"/></td><td class="official-cell"><div class="official-main"><span class="official-val" :class="{unset:!officialHasValue(a)}">{{officialMain(a)}}</span><button class="btn s" @click="openPackages(a)" :disabled="busyKey(a.id,'resource')">明细</button></div><div class="official-meta" :class="{'pkg-warn':officialWarn(a)}">{{officialMeta(a)}}</div><div class="cache-note" v-if="a.official_resource">缓存 {{cacheAge(a)}}</div></td><td class="official-cell"><template v-if="String(a.provider||'workbuddy').startsWith('workbuddy')"><div class="official-main"><span class="official-val" :class="{'pkg-warn':officialWarn(a)}">{{credit(a.official_resource?.expiring_30d_total)}}</span><span class="tag" v-if="a.official_resource?.next_expire_time">{{shortTime(a.official_resource.next_expire_time)}}</span></div><div class="official-meta">最近到期 {{credit(a.official_resource?.next_expire_amount)}} · {{a.official_resource?.next_expire_days??'-'}} 天</div></template><span class="official-val unset" v-else>—</span></td><td class="credit-cell"><div class="credit-main"><span class="credit-rem" v-if="a.credit_snapshot>0">{{credit(a.credit_remaining)}}</span><span class="credit-rem unset" v-else>未设置</span><span class="tag">{{a.credit_snapshot>0?credit(a.credit_used_pct)+'%':'备用'}}</span></div><div class="progress" :class="{err:a.credit_snapshot>0&&a.credit_used_pct>=90,ok:a.credit_snapshot>0&&a.credit_used_pct<70}"><span :style="{width:creditPct(a)}"></span></div><div class="credit-meta">{{a.credit_snapshot>0?'快照后已用 '+credit(a.credit_since_snapshot):'官方失败时可手动校准'}}</div></td><td><input class="numctl credit" v-model.number="a._creditSnapshot" type="number" min="0" step="0.01" placeholder="0"/></td><td>{{tokenLife(a)}}<div class="cache-note">{{refreshLife(a)}}</div></td><td>{{a.total_requests}}</td><td>{{tok(a.total_tokens)}}</td><td>{{credit(a.total_credits)}}</td><td class="ops-cell" :class="{'menu-open':rowMenu===a.id}"><div class="ops"><button class="btn s" @click="toggle(a)" :disabled="busyKey(a.id,'toggle')">{{busyKey(a.id,'toggle')?'处理中':(a.status==='active'?'禁用':'启用')}}</button><button class="btn s" @click="openTest(a)" :disabled="tl===a.id">{{tl===a.id?'测试中':'测试'}}</button><button class="btn s danger" @click="del(a)">删除</button><div class="more" @click.stop><button class="btn s more-btn" :class="{on:rowMenu===a.id}" @click="toggleRowMenu(a.id,$event)" title="更多">⋯</button><Teleport to="body"><div class="row-menu" v-if="rowMenu===a.id" :style="{top:rowMenuPos.top+'px',left:rowMenuPos.left+'px'}" @mousedown.stop @click.stop><button type="button" class="btn s" @click.prevent.stop="saveMeta(a);queueMenuClose()" :disabled="savingAll||!dirty(a)||busyKey(a.id,'save')">{{busyKey(a.id,'save')?'保存中':'保存'}}</button><button type="button" class="btn s" @click.prevent.stop="refreshResource(a,false,true);queueMenuClose()" :disabled="busyKey(a.id,'resource')||a.status!=='active'">{{busyKey(a.id,'resource')?'刷新中':'额度'}}</button><button type="button" class="btn s" @click.prevent.stop="claimOne(a);queueMenuClose()" :disabled="busyKey(a.id,'claim')||a.status!=='active'">{{busyKey(a.id,'claim')?'领取中':'领取'}}</button><button type="button" class="btn s" @click.prevent.stop="ref2(a);queueMenuClose()" :disabled="busyKey(a.id,'refresh')">{{busyKey(a.id,'refresh')?'续期中':'续期'}}</button></div></Teleport></div></div></td></tr>
-    <tr v-if="!visibleAccounts.length"><td colspan="16" class="empty">没有匹配的账号</td></tr>
+  <div class="card" v-else-if="l.length"><div class="card-h rf-head"><span>账号列表</span><span class="rf-order"><span class="rf-note" title="请求模型实际被选号的先后">路由规则</span><span class="rf-chain"><span class="rf-step" title="先过滤：通道已启用、账号状态 active、不在冷却中、额度没有被证实耗尽、且该通道能服务这个模型。被过滤掉的账号不参与排序。">账号有效且有额度</span><span class="rf-arrow">→</span><span class="rf-step" title="数字大的排前面（优先级是账号自己的属性，和同组有谁无关）。">优先级</span><span class="rf-arrow">→</span><span class="rf-step" title="前两层都相同时，按通道顺序（模型配置页里可拖拽调整）。">通道顺序</span></span><button type="button" class="btn s" :class="{'pri':dirtyRows.length>0}" :disabled="!dirtyRows.length||accountSaving" @click="saveAllDirty()">{{accountSaving?'保存中':('保存修改'+(dirtyRows.length?' ('+dirtyRows.length+')':''))}}</button></span></div><div class="card-p" style="padding-bottom:0"><div class="control-row"><input class="searchbox" v-model="filters.q" placeholder="搜索账号 / UID / 域名"/><select class="selectctl" v-model="filters.status"><option value="all">全部状态</option><option value="active">active</option><option value="inactive">inactive</option><option value="expired">expired</option></select><select class="selectctl" v-model="filters.claim"><option value="all">全部领取状态</option><option value="available">可领取</option><option value="claimed">今日已领</option><option value="failed">领取失败</option></select><select class="selectctl" v-model="filters.sort"><option value="order">优先级/通道顺序</option><option value="balance">官方余额高到低</option><option value="expire">最近到期优先</option><option value="requests">请求数高到低</option><option value="used">累计已用高到低</option></select><div class="spacer"></div><span class="tag">当前 {{visibleAccounts.length}} 条</span></div></div><div class="table-scroll"><table><thead><tr><th>账号</th><th>通道</th><th>UID</th><th>状态</th><th>今日领取</th><th>优先级</th><th>官方余额</th><th>即将到期</th><th>本地估算</th><th>本地快照</th><th>Token 有效期</th><th>请求</th><th>Token</th><th>累计已用</th><th class="ops-head"></th></tr></thead><tbody>
+    <tr v-for="a in visibleAccounts" :key="a.id"><td style="font-weight:600">{{a.nickname||a.name}} <span class="tag warn" v-if="dirty(a)">未保存</span></td><td><span class="tag">{{a.provider||'workbuddy'}}</span></td><td class="mono">{{a.uid?.slice(0,8)}}…</td><td><span class="badge" :class="a.status">{{a.status}}</span></td><td><span class="badge" :class="checkinClass(a)">{{checkinText(a)}}</span><div class="cache-note" v-if="checkins[a.id]?.stale">旧缓存</div></td><td><input class="numctl" v-model.number="a._priority" type="number" min="-100" max="100" title="数字越大越优先；改完点上方「保存修改」批量保存"/><label class="hint">权重 <input class="numctl" type="number" min="1" v-model.number="a._weight" title="同优先级、同通道内优先使用高权重账号；不会强制分流"/></label></td><td class="official-cell"><div class="official-main"><span class="official-val" :class="{unset:!officialHasValue(a)}">{{officialMain(a)}}</span><button class="btn s" @click="openPackages(a)" :disabled="busyKey(a.id,'resource')">明细</button></div><div class="official-meta" :class="{'pkg-warn':officialWarn(a)}">{{officialMeta(a)}}</div><div class="cache-note" v-if="a.official_resource">缓存 {{cacheAge(a)}}</div></td><td class="official-cell"><template v-if="a.official_resource && String(a.provider||'workbuddy').startsWith('workbuddy')"><div class="exp-grid"><span class="exp-val" :class="{'pkg-warn':officialWarn(a)}">{{credit(a.official_resource?.expiring_30d_total)}}</span><span class="tag" v-if="a.official_resource?.next_expire_time">{{shortTime(a.official_resource.next_expire_time)}}</span><span v-else></span><span class="exp-val">{{credit(a.official_resource?.next_expire_amount)}}</span><span class="exp-days">{{expDaysText(a)}}</span></div></template><template v-else-if="a.routing?.urgency_source==='daily'"><div class="exp-grid"><span></span><span class="tag">{{resetClock()}}</span><span></span><span class="exp-days" :title="URGENCY_DAILY_TITLE">{{urgencyDailyText(a)}}</span></div></template><div class="exp-dash" v-else>-</div></td><td class="credit-cell"><div class="credit-main"><span class="credit-rem" v-if="a.credit_snapshot>0">{{credit(a.credit_remaining)}}</span><span class="credit-rem unset" v-else>未设置</span><span class="tag">{{a.credit_snapshot>0?credit(a.credit_used_pct)+'%':'备用'}}</span></div><div class="progress" :class="{err:a.credit_snapshot>0&&a.credit_used_pct>=90,ok:a.credit_snapshot>0&&a.credit_used_pct<70}"><span :style="{width:creditPct(a)}"></span></div><div class="credit-meta">{{a.credit_snapshot>0?'快照后已用 '+credit(a.credit_since_snapshot):'官方失败时可手动校准'}}</div></td><td><input class="numctl credit" v-model.number="a._creditSnapshot" type="number" min="0" step="0.01" placeholder="0"/></td><td>{{tokenLife(a)}}<div class="cache-note">{{refreshLife(a)}}</div></td><td>{{a.total_requests}}</td><td>{{tok(a.total_tokens)}}</td><td>{{credit(a.total_credits)}}</td><td class="ops-cell" :class="{'menu-open':rowMenu===a.id}"><div class="ops"><button class="btn s" @click="toggle(a)" :disabled="busyKey(a.id,'toggle')">{{busyKey(a.id,'toggle')?'处理中':(a.status==='active'?'禁用':'启用')}}</button><button class="btn s" @click="openTest(a)" :disabled="tl===a.id">{{tl===a.id?'测试中':'测试'}}</button><button class="btn s danger" @click="del(a)">删除</button><div class="more" @click.stop><button class="btn s more-btn" :class="{on:rowMenu===a.id}" @click="toggleRowMenu(a.id,$event)" title="更多">⋯</button><Teleport to="body"><div class="row-menu" v-if="rowMenu===a.id" :style="{top:rowMenuPos.top+'px',left:rowMenuPos.left+'px'}" @mousedown.stop @click.stop><button type="button" class="btn s" @click.prevent.stop="saveMeta(a);queueMenuClose()" :disabled="!dirty(a)||busyKey(a.id,'save')">{{busyKey(a.id,'save')?'保存中':'保存'}}</button><button type="button" class="btn s" @click.prevent.stop="refreshResource(a,false,true);queueMenuClose()" :disabled="busyKey(a.id,'resource')||a.status!=='active'">{{busyKey(a.id,'resource')?'刷新中':'额度'}}</button><button type="button" class="btn s" @click.prevent.stop="claimOne(a);queueMenuClose()" :disabled="busyKey(a.id,'claim')||a.status!=='active'">{{busyKey(a.id,'claim')?'领取中':'领取'}}</button><button type="button" class="btn s" @click.prevent.stop="ref2(a);queueMenuClose()" :disabled="busyKey(a.id,'refresh')">{{busyKey(a.id,'refresh')?'续期中':'续期'}}</button></div></Teleport></div></div></td></tr>
+    <tr v-if="!visibleAccounts.length"><td colspan="15" class="empty">没有匹配的账号</td></tr>
   </tbody></table></div></div>
   <div class="card card-p empty" v-else><div class="em">🔌</div><p>暂无账号 · 用浏览器登录添加 WorkBuddy，或从上方导入本机登录文件</p></div>
   <div class="ov" v-if="pkg" @click.self="pkg=null"><div class="modal wide"><div class="modal-h"><h3>官方额度明细 · {{pkg.account.nickname||pkg.account.name}}</h3><button class="x" @click="pkg=null">&times;</button></div><div class="modal-b"><div class="pkg-grid" v-if="pkg.resource.unit==='token'"><div class="pkg-kpi"><div class="k">今日已用</div><div class="v">{{tok(pkg.resource.used)}}</div></div><div class="pkg-kpi"><div class="k">今日上限</div><div class="v">{{tok(pkg.resource.limit)}}</div></div><div class="pkg-kpi"><div class="k">剩余</div><div class="v">{{tok(pkg.resource.remaining)}}</div></div></div><div class="pkg-grid" v-else><div class="pkg-kpi"><div class="k">官方余额</div><div class="v">{{credit(pkg.resource.total_dosage??pkg.resource.remaining)}}</div></div><div class="pkg-kpi"><div class="k">30 天内到期</div><div class="v" :class="{'pkg-warn':Number(pkg.resource.expiring_30d_total||0)>0}">{{credit(pkg.resource.expiring_30d_total)}}</div></div><div class="pkg-kpi"><div class="k">额度包</div><div class="v">{{pkg.resource.package_count||0}}</div></div></div><div class="testbox" v-if="!pkg.resource.ok"><div class="row"><span>状态</span><span><span class="badge err">失败</span></span></div><div class="msg">{{pkg.resource.message||'官方额度读取失败'}}</div></div><table class="mini-table" v-else-if="pkg.resource.unit!=='token'&&pkg.resource.packages?.length"><thead><tr><th>额度包</th><th>剩余</th><th>已用</th><th>大小</th><th>周期</th><th>到期</th><th>状态</th></tr></thead><tbody><tr v-for="(x,i) in pkg.resource.packages" :key="i"><td><div class="pkg-name" :title="x.package_name">{{x.package_name}}</div><div class="hint">{{x.product_name||x.package_type||x.resource_type}}</div></td><td class="mono">{{credit(x.remaining_precise)}}</td><td class="mono">{{credit(x.cycle_used||x.used)}}</td><td class="mono">{{credit(x.cycle_size||x.size)}}</td><td class="pkg-time">{{shortTime(x.cycle_start)}} → {{shortTime(x.cycle_end)}}</td><td class="pkg-time" :class="{'pkg-warn':Number(x.days_to_expire)>=0&&Number(x.days_to_expire)<=30}">{{x.expire_time||'-'}}<div class="hint">{{expireText(x)}}</div></td><td><span class="badge" :class="pkgBadge(x)">{{x.expired?'已过期':'可用'}}</span></td></tr></tbody></table><div class="empty" v-else-if="pkg.resource.unit!=='token'">暂无额度包明细</div><div class="hint" v-if="pkg.resource.unit!=='token' && String(pkg.account.provider||'workbuddy').startsWith('workbuddy')" style="margin-top:10px">每日领取的 150 会作为独立额度资源进入这里；实际到期时间以官方返回的 CycleEndTime / DeductionEndTime 为准。</div></div><div class="modal-f"><button class="btn" @click="refreshPackages" :disabled="busyKey(pkg.account.id,'resource')">{{busyKey(pkg.account.id,'resource')?'刷新中':'刷新'}}</button><button class="btn pri" @click="pkg=null">关闭</button></div></div></div>
@@ -1199,7 +1229,7 @@ createApp({
   <div class="callout" v-if="legacyKeys.length" style="margin-bottom:12px">有 {{legacyKeys.length}} 把旧的 Codex 类型 Key。更新后字符串不变，客户端不用改配置，只是不再按类型裁超长历史。<button class="btn s" style="margin-left:8px" @click="updateLegacyKeys" :disabled="updatingLegacy">{{updatingLegacy?'更新中':'更新为普通 Key'}}</button></div>
   <div v-if="ld" class="load"><div class="spin"></div></div>
   <div class="card" v-else-if="l.length"><table><thead><tr><th>名称</th><th>通道</th><th>Key</th><th>状态</th><th>模型</th><th>今日/限额</th><th>请求</th><th>Token</th><th></th></tr></thead><tbody>
-    <tr v-for="k in l" :key="k.id"><td style="font-weight:600">{{k.name||'-'}}</td><td><select class="selectctl keys-channel" :value="k.default_channel||'workbuddy'" @change="setChannel(k,$event.target.value)" :disabled="busyKey(k.id,'ch')"><option v-for="c in channelOptions()" :key="c.id" :value="c.id">{{c.display_name||c.id}}</option></select></td><td><div style="display:flex;align-items:center;gap:5px;min-width:230px"><code style="flex:1;word-break:break-all">{{shown[k.id]&&k.key?k.key:(k.key_prefix||'-')}}</code><button v-if="k.key" class="btn s" @click="toggleKey(k)">{{shown[k.id]?'隐藏':'显示'}}</button><button v-if="k.key" class="btn s" @click="cp(k.key)" title="复制完整 API Key"><span v-html="I.copy"></span></button><span v-else class="tag" title="旧版本只保存了哈希，无法还原原始 Key">旧 Key 不可恢复</span></div></td><td><span class="badge" :class="k.status">{{k.status}}</span></td><td>{{k.allowed_models?k.allowed_models.join(', '):'全部'}}</td><td>{{k.today_requests||0}} / {{k.daily_limit||'不限'}}</td><td>{{k.total_requests}}</td><td>{{tok(k.total_tokens)}}</td><td><button class="btn s" @click="toggle(k)" :disabled="busyKey(k.id,'toggle')" style="margin-right:4px">{{busyKey(k.id,'toggle')?'...':(k.status==='active'?'禁用':'启用')}}</button><button class="btn s danger" @click="del(k)" :disabled="busyKey(k.id,'del')">{{busyKey(k.id,'del')?'...':'删除'}}</button></td></tr>
+    <tr v-for="k in l" :key="k.id"><td style="font-weight:600">{{k.name||'-'}}</td><td><select class="selectctl keys-channel" :value="k.default_channel||'workbuddy'" @change="setChannel(k,$event.target.value)" :disabled="busyKey(k.id,'ch')"><option v-for="c in channelOptions()" :key="c.id" :value="c.id">{{c.display_name||c.id}}</option></select></td><td><div style="display:flex;align-items:center;gap:5px;min-width:230px"><code style="flex:1;word-break:break-all">{{shown[k.id]&&k.key?k.key:(k.key_prefix||'-')}}</code><button v-if="k.key" class="btn s" @click="toggleKey(k)">{{shown[k.id]?'隐藏':'显示'}}</button><button v-if="k.key" class="btn s" @click="cp(k.key)" title="复制完整 API Key"><span v-html="I.copy"></span></button><span v-else class="tag" title="旧版本只保存了哈希，无法还原原始 Key">旧 Key 不可恢复</span></div></td><td><span class="badge" :class="k.status">{{k.status}}</span></td><td>{{k.allowed_models?k.allowed_models.join(', '):'全部'}}</td><td>{{k.today_requests||0}} / {{k.daily_limit||'—'}}</td><td>{{k.total_requests}}</td><td>{{tok(k.total_tokens)}}</td><td><button class="btn s" @click="toggle(k)" :disabled="busyKey(k.id,'toggle')" style="margin-right:4px">{{busyKey(k.id,'toggle')?'...':(k.status==='active'?'禁用':'启用')}}</button><button class="btn s danger" @click="del(k)" :disabled="busyKey(k.id,'del')">{{busyKey(k.id,'del')?'...':'删除'}}</button></td></tr>
   </tbody></table></div>
   <div class="card card-p empty" v-else><div class="em">🔑</div><p>暂无 Key</p></div>
 
@@ -1211,7 +1241,7 @@ createApp({
       <div class="field"><label>通道</label><select class="selectctl channel-select" v-model="f.channel"><option v-for="c in channelOptions()" :key="c.id" :value="c.id">{{c.display_name||c.id}}</option></select><div class="hint channel-hint">选具体通道时，这把 Key 只打那一家。选「自动通道」后，带前缀的 <span class="mono">通道/模型</span> 打到对应通道；不带前缀的模型进第一家认得它且已有账号的通道；<span class="mono">auto</span> 走第一个有可用账号的通道。额度用尽不会换到另一家。可在列表里切换；进行中的请求不会改绑。</div></div>
       <div class="field"><label>名称</label><input v-model="f.name" placeholder="Key 名称"/></div>
       <div class="field"><label>允许模型</label><input v-model="f.models" placeholder="auto,glm-5.2（留空=全部）"/></div>
-      <div class="field"><label>每日请求限额</label><input v-model="f.limit" type="number" placeholder="不限"/></div>
+      <div class="field"><label>每日请求限额</label><input v-model="f.limit" type="number" placeholder="留空即无上限"/></div>
 
     </template>
   </div><div class="modal-f"><button class="btn" @click="close">{{res?'关闭':'取消'}}</button><button class="btn pri" @click="create" v-if="!res" :disabled="saving">{{saving?'创建中':'创建'}}</button></div></div></div>
@@ -1221,6 +1251,53 @@ createApp({
   const FALLBACK_CH=[{id:'workbuddy',display_name:'WorkBuddy 国内版'},{id:'workbuddy-i',display_name:'WorkBuddy 国际版'},{id:'qwenwork',display_name:'QwenWork / 千问办公'},{id:'qoder',display_name:'Qoder 中国版'},{id:'qoder-i',display_name:'Qoder 国际版'},{id:'traework',display_name:'TraeWork'},{id:'loomy',display_name:'Loomy'},{id:'xiaohuanxiong',display_name:'小浣熊'}];
   const addForm=reactive({channel:'workbuddy',id:'',name:''});
   const newKey=ref(''),newVal=ref('');
+  const orderRows=ref([]),savingOrder=ref(false),orderDirty=ref(false);
+  async function loadOrder(){try{const r=await api.get('/admin/channel-order',p.token);orderRows.value=(r.channels||[]).map(x=>({...x}))}catch(e){orderRows.value=[]}}
+  async function saveOrder(quiet){if(savingOrder.value){orderDirty.value=true;return}savingOrder.value=true;try{await api.put('/admin/channel-order',{order:orderRows.value.map(x=>x.id)},p.token);if(!quiet)p.toast('通道顺序已保存','ok')}catch(e){p.toast(apiErr(e,'保存失败'),'err');await loadOrder()}savingOrder.value=false;if(orderDirty.value){orderDirty.value=false;saveOrder(true)}}
+  const orderedSources=computed(()=>{const pos=new Map(orderRows.value.map((r,i)=>[r.id,i]));return [...sources.value].sort((a,b)=>{const x=pos.has(a.channel)?pos.get(a.channel):1e6,y=pos.has(b.channel)?pos.get(b.channel):1e6;return x-y})});
+  function srcRoutable(ch){const r=orderRows.value.find(x=>x.id===ch);return r?r.routable:null}
+  const dragCh=ref(null);
+  const dragOverCh=ref(null),dragBelow=ref(false);
+  function clearDragMark(){dragOverCh.value=null;dragBelow.value=false;dragCh.value=null}
+  function moveDragged(target,below){
+    const src=dragCh.value;
+    if(!src||src===target)return;
+    const n=[...orderRows.value];
+    const i=n.findIndex(r=>r.id===src);
+    if(i<0)return;
+    const row=n.splice(i,1)[0];
+    // Re-locate the target after removing the source: its index shifted.
+    const k=n.findIndex(r=>r.id===target);
+    if(k<0){orderRows.value=n;return}
+    n.splice(below?k+1:k,0,row);orderRows.value=n;saveOrder(true);
+  }
+  function onDragStart(ev,ch){
+    dragCh.value=ch;ev.dataTransfer.effectAllowed='move';
+    // Firefox refuses to arm a drag unless the payload is written.
+    try{ev.dataTransfer.setData('text/plain',ch)}catch(_){}
+  }
+  function onDragOver(ev,ch){
+    if(!dragCh.value||dragCh.value===ch)return;
+    ev.preventDefault();ev.dataTransfer.dropEffect='move';
+    const cell=ev.currentTarget.getBoundingClientRect();
+    dragOverCh.value=ch;dragBelow.value=ev.clientY>cell.top+cell.height/2;
+  }
+  function onDragLeave(ev,ch){if(dragOverCh.value===ch&&ev.relatedTarget&&!ev.currentTarget.contains(ev.relatedTarget))dragOverCh.value=null}
+  function onDropRow(ev,ch){if(!dragCh.value||dragCh.value===ch)return;ev.preventDefault();moveDragged(ch,dragBelow.value);clearDragMark()}
+  function onDragEnd(){clearDragMark()}
+  // ---- routing behaviour: caps + per-channel urgency + live preview ----
+  const rc=reactive({routing_account_rpm:60,routing_account_inflight:4,routing_low_watermark_pct:5,routing_inflight_window_seconds:15});
+  const rcDefaults=ref({});
+  const rcUrgency=ref({});
+  const routeCfg=ref(false),savingCfg=ref(false);
+  async function loadRouteCfg(){try{const r=await api.get('/admin/routing-settings',p.token);const s=r.settings||{};Object.keys(rc).forEach(k=>{if(s[k]!=null)rc[k]=s[k]});rcDefaults.value=r.defaults||{};rcUrgency.value={...(s.routing_channel_urgency||{})}}catch(e){}}
+  async function saveRouteCfg(){if(savingCfg.value)return;savingCfg.value=true;try{const map={};Object.keys(rcUrgency.value).forEach(k=>{const v=rcUrgency.value[k];if(v!==''&&v!=null)map[k]=Number(v)});await api.put('/admin/routing-settings',{routing_account_rpm:Number(rc.routing_account_rpm)||0,routing_account_inflight:Number(rc.routing_account_inflight)||0,routing_low_watermark_pct:Number(rc.routing_low_watermark_pct)||0,routing_inflight_window_seconds:Number(rc.routing_inflight_window_seconds)||15,routing_channel_urgency:map},p.token);p.toast('路由配置已保存','ok');await loadRouteCfg();await load(true)}catch(e){p.toast(apiErr(e,'保存失败'),'err')}savingCfg.value=false}
+  const plan=ref(null),planModel=ref(''),loadingPlan=ref(false);
+  async function loadPlan(){if(loadingPlan.value)return;loadingPlan.value=true;try{const q=planModel.value?('?model='+encodeURIComponent(planModel.value)):'';plan.value=await api.get('/admin/routing-plan'+q,p.token)}catch(e){p.toast(apiErr(e,'预览失败'),'err')}loadingPlan.value=false}
+  // 预案卡小表的顺位同样只显示后端算好的账号池全局编号（global_rank），通道内位置降为 title 的次要信息。
+  // 字段未上线（旧服务/旧数据）时为 undefined → 显示「—」，绝不回退成通道内编号，否则每个通道又会从 #1 开始。
+  function planRank(r){return (r&&r.global_rank!=null)?('#'+r.global_rank):'—'}
+  function planRankTitle(r){const inner=(r&&r.rank!=null)?(' · 本通道内第 '+String(r.rank)+' 个被选中'):'';return (r&&r.global_rank!=null)?('路由第 '+r.global_rank+' 位'+inner):('不参与路由 · 不计入路由顺序'+inner)}
   const channels=computed(()=>sources.value.length?sources.value.map(s=>({id:s.channel,display_name:s.display_name||s.channel})):FALLBACK_CH);
   function applyAliasSnapshot(snap){
     const maps={}, keys={};
@@ -1274,6 +1351,17 @@ createApp({
   async function rmExtra(channel,id){
     try{await api.del('/admin/models/catalogs?channel='+encodeURIComponent(channel)+'&model_id='+encodeURIComponent(id),p.token);p.toast('已删除');await refreshCatalogs()}catch(e){p.toast(apiErr(e,'删除失败'),'err')}
   }
+  // 忽略余额检查：这个模型请求时不判断账号余额（账号仍需可用）。标记只作用于本通道的这个模型。
+  async function toggleExempt(channel,row){
+    const next=!row.exempt;
+    try{
+      const r=await api.post('/admin/models/exempt',{channel,id:row.id,exempt:next},p.token);
+      row.exempt=next;
+      const s=sources.value.find(x=>x.channel===channel);
+      if(s&&r.models)s.models=r.models;
+      p.toast((next?'已忽略余额检查：':'已取消忽略余额检查：')+row.id)
+    }catch(e){p.toast(apiErr(e,'设置失败'),'err')}
+  }
   function isBuiltin(k){return (builtinKeys.value[aliasChannel.value]||[]).includes(k)}
   function addAlias(){
     const ch=aliasChannel.value,k=newKey.value.trim(),v=newVal.value.trim();
@@ -1288,30 +1376,36 @@ createApp({
   function rmAlias(k){const ch=aliasChannel.value;const o={...(al.value[ch]||{})};delete o[k];al.value={...al.value,[ch]:o}}
   function modeText(s){return s.mode==='live'?'在线读取':(s.mode==='fallback'?'回退本地':'未读取')}
   function modeClass(s){return s.mode==='live'?'ok':(s.mode==='fallback'?'warn':'')}
+  // 预案卡的「余额」格要用它；这个组件作用域里原先没有，点「预览实际顺位」会抛 credit is not a function
+  function credit(v){v=Number(v||0);return v.toLocaleString('zh-CN',{maximumFractionDigits:4})}
   const modelSources=computed(()=>channels.value.map(c=>{const s=sources.value.find(x=>x.channel===c.id)||{};return {...s,channel:c.id,display_name:c.display_name,models:s.models||[]}}));
   const aliasRows=computed(()=>al.value[aliasChannel.value]||{});
   const aliasTargets=computed(()=>{const s=modelSources.value.find(x=>x.channel===aliasChannel.value);return s?s.models:[]});
   const aliasChannelName=computed(()=>(channels.value.find(c=>c.id===aliasChannel.value)||{}).display_name||aliasChannel.value);
-  onMounted(load);return{al,ld,sources,modelSources,syncing,adding,addOpen,addForm,channels,load,save,syncSources,openAdd,closeAdd,submitAdd,rmExtra,newKey,newVal,addAlias,rmAlias,isBuiltin,modeText,modeClass,aliasChannel,aliasRows,aliasTargets,aliasChannelName,I}
+  onMounted(()=>{load();loadOrder();loadRouteCfg()});return{al,ld,sources,modelSources,syncing,adding,addOpen,addForm,channels,load,save,syncSources,openAdd,closeAdd,submitAdd,rmExtra,toggleExempt,newKey,newVal,addAlias,rmAlias,isBuiltin,modeText,modeClass,credit,aliasChannel,aliasRows,aliasTargets,aliasChannelName,orderRows,savingOrder,orderDirty,saveOrder,orderedSources,srcRoutable,dragCh,dragOverCh,dragBelow,onDragStart,onDragOver,onDragLeave,onDropRow,onDragEnd,routeCfg,rc,rcDefaults,rcUrgency,savingCfg,loadRouteCfg,saveRouteCfg,plan,planModel,loadingPlan,loadPlan,planRank,planRankTitle,I}
 },template:`
 <div>
   <div class="phead"><h1>模型配置</h1><p>各通道目录来自上游或本地回退；自定义模型用“添加模型”，官方条目不改名</p></div>
   <div class="tbar"><button class="btn s pri" @click="syncSources" :disabled="syncing"><span v-html="I.scan"></span>{{syncing?'读取中':'一键读取供应模型'}}</button><button class="btn s pri" @click="save">保存别名</button><button class="btn s" @click="openAdd"><span v-html="I.plus"></span>添加模型</button><button class="btn s" @click="load" :disabled="ld"><span v-html="I.refresh"></span>刷新</button></div>
-  <div class="card" v-if="sources.length" style="margin-bottom:12px"><div class="card-h">各通道供应模型<span class="sub">在线读取或回退本地/后台列表，互不合并</span></div>
+  <div class="card" v-if="sources.length" style="margin-bottom:12px"><div class="card-h">各通道供应模型<span class="src-drag-hint" title="按住行拖动排序；账号优先级相同时按此顺序选通道"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg>拖拽调整通道路由顺序；账号优先级相同时按此顺序选通道</span><button class="btn s pri" style="margin-left:auto" @click="saveOrder" :disabled="savingOrder||!orderRows.length">{{savingOrder?'保存中':'保存顺序'}}</button></div>
+    <div class="table-scroll src-scroll">
     <table><thead><tr><th>通道</th><th>方式</th><th>数量</th><th>说明</th></tr></thead><tbody>
-    <tr v-for="s in sources" :key="s.channel"><td>{{s.display_name||s.channel}} <span class="tag">{{s.channel}}</span></td><td><span class="badge" :class="modeClass(s)">{{modeText(s)}}</span></td><td>{{s.count||0}}</td><td class="mono" style="color:var(--fg3)">{{s.message||'—'}}</td></tr>
+    <tr v-for="s in orderedSources" :key="s.channel" class="src-row" :class="{dragging:dragCh===s.channel,'drag-over':dragOverCh===s.channel&&dragCh!==s.channel,'drag-below':dragOverCh===s.channel&&dragBelow}" draggable="true" @dragstart="onDragStart($event,s.channel)" @dragover="onDragOver($event,s.channel)" @dragleave="onDragLeave($event,s.channel)" @drop="onDropRow($event,s.channel)" @dragend="onDragEnd"><td>{{s.display_name||s.channel}} <span class="tag">{{s.channel}}</span> <span class="tag warn" v-if="srcRoutable(s.channel)===false" title="没有活跃账号，不参与路由">未参与路由</span></td><td><span class="badge" :class="modeClass(s)">{{modeText(s)}}</span></td><td>{{s.count||0}}</td><td class="mono" style="color:var(--fg3)">{{s.message||'—'}}</td></tr>
     </tbody></table>
+    </div>
+    <div class="hint" style="padding:8px 16px">优先看账号优先级，只有最高优先级相同的通道之间才比较这里的位置。没有活跃账号的通道不参与路由，也不会出现在客户端模型列表里。</div>
   </div>
   <div class="card" v-for="s in modelSources" :key="'cat-'+s.channel" style="margin-bottom:12px">
     <div class="card-h">{{s.display_name||s.channel}}<span class="sub">{{s.models.length}} 个模型</span><span class="badge" :class="modeClass(s)">{{modeText(s)}}</span></div>
-    <div class="hint" style="padding:8px 16px">客户端使用 {{s.channel}}/模型ID{{s.channel==='workbuddy'?'，也支持裸 ID':''}}。官方目录以一键读取为准；手动项可删除。</div>
-    <table><thead><tr><th>模型 ID</th><th>名称</th><th>操作</th></tr></thead><tbody>
+    <div class="hint" style="padding:8px 16px">客户端使用 {{s.channel}}/模型ID{{s.channel==='workbuddy'?'，也支持裸 ID':''}}。官方目录以一键读取为准；手动项可删除。「忽略余额检查」的模型请求时不判断账号余额。</div>
+    <table><thead><tr><th>模型 ID</th><th>名称</th><th>忽略余额检查</th><th>操作</th></tr></thead><tbody>
     <tr v-for="(x,i) in s.models" :key="s.channel+'-'+i">
       <td class="mono">{{s.channel}}/{{x.id}} <span v-if="x.manual" class="tag">手动</span></td>
       <td>{{x.name||x.id}}</td>
+      <td><button class="btn s" :class="{'pri':x.exempt}" title="标记后，请求这个模型时不判断账号余额（账号仍需可用）" @click="toggleExempt(s.channel,x)">{{x.exempt?'已忽略余额检查':'忽略余额检查'}}</button></td>
       <td><button v-if="x.manual" class="btn s danger" @click="rmExtra(s.channel,x.id)">删除</button><span v-else class="muted">—</span></td>
     </tr>
-    <tr v-if="!s.models.length"><td colspan="3" class="empty">暂无模型</td></tr>
+    <tr v-if="!s.models.length"><td colspan="4" class="empty">暂无模型</td></tr>
     </tbody></table>
   </div>
   <div class="ov" v-if="addOpen" @click.self="closeAdd"><div class="modal"><div class="modal-h"><h3>添加模型</h3><button class="x" @click="closeAdd">&times;</button></div><div class="modal-b">
@@ -1321,12 +1415,42 @@ createApp({
   </div><div class="modal-f"><button class="btn" @click="closeAdd">取消</button><button class="btn pri" @click="submitAdd" :disabled="adding">{{adding?'添加中':'添加'}}</button></div></div></div>
   <div v-if="ld" class="load"><div class="spin"></div></div>
   <template v-else>
+  <div class="card" style="margin-bottom:12px"><div class="card-h">路由规则<span class="sub">决定先用哪个号，改完立即生效</span><button class="btn s pri" style="margin-left:auto" @click="saveRouteCfg" :disabled="savingCfg">{{savingCfg?'保存中':'保存配置'}}</button></div>
+    <div style="padding:12px 16px;border-bottom:1px solid var(--border2)">
+      <div class="hint" style="margin-bottom:10px">顺序由<b>账号优先级 → 通道顺序 → 账号权重</b>决定；同优先级和权重下继续使用当前账号，不强制分流。失败后逐号回退。带通道前缀或绑定通道的 Key 只在该通道内尝试。</div>
+      <div class="hint">余额归零只暂停模型调度，不停用账号的签到。签到积累后，在账号页点击「额度」刷新；读到正余额即恢复调度。未知余额不阻止请求，免费模型可标记「忽略余额检查」。</div>
+      <div v-if="orderRows.length" style="margin-top:12px">
+        <div class="hint" style="margin-bottom:6px">各通道的默认寿命(到期)（天）：仅用于「即将到期」列的展示与人工参考，不参与路由顺序判定；留空表示不设到期判定。</div>
+        <div class="control-row" style="flex-wrap:wrap;gap:10px">
+          <label class="rc-field" v-for="c in orderRows" :key="'u-'+c.id"><span>{{c.display_name||c.id}}</span><input class="numctl" type="number" min="0" step="0.1" v-model="rcUrgency[c.id]" :placeholder="String(rcDefaults.routing_channel_urgency?.[c.id]??9999)"/></label>
+        </div>
+      </div>
+      <div class="hint" style="margin-top:8px">每日额度的到期时间仅供展示，不影响优先级和权重；账号上已保存的手填寿命仍优先于这里的通道默认值。</div>
+    </div>
+    <div style="padding:12px 16px">
+      <div class="control-row" style="gap:8px">
+        <input v-model="planModel" placeholder="模型，例如 xiaohuanxiong/sn-deepseek-v4-1-flash-1017，留空看全部通道" style="flex:1;min-width:220px;padding:5px 8px;border:1px solid #e8e8e8;border-radius:4px;font:inherit;font-size:12px;font-family:var(--mono)"/>
+        <button class="btn s" @click="loadPlan" :disabled="loadingPlan">{{loadingPlan?'计算中':'预览实际顺位'}}</button>
+      </div>
+      <div class="hint" style="margin:8px 0">通道与顺位都由后端一次算好，并按真实试序返回；这里只显示结果——页面不会自己再排一遍。</div>
+      <template v-if="plan">
+        <div v-if="!plan.channels.length" class="empty">没有通道能服务这个模型</div>
+        <div v-for="ch in plan.channels" :key="ch.channel" style="margin-top:10px">
+          <div style="font-weight:600;font-size:12px;margin-bottom:4px">{{ch.display_name}} <span class="tag">{{ch.channel}}</span> <span class="hint" v-if="ch.try_order">路由次序 #{{ch.try_order}}</span> <span class="hint" v-if="ch.channel_rank!=null">配置顺序 #{{ch.channel_rank+1}}</span></div>
+          <table class="mini-table" v-if="ch.accounts.length"><thead><tr><th title="本页各通道账号池的全局编号">路由顺序</th><th>账号</th><th>优先级</th><th>寿命(到期)</th><th>来源</th><th>余额</th><th>状态</th></tr></thead><tbody>
+            <tr v-for="r in ch.accounts" :key="r.id"><td class="mono" :title="planRankTitle(r)">{{planRank(r)}}</td><td>{{r.name||('#'+r.id)}}</td><td class="mono">{{r.priority}}</td><td class="mono">{{r.urgency_days>=9999?'—':r.urgency_days.toFixed(2)+' 天'}}</td><td><span class="tag">{{r.urgency_source==='manual'?'手动':(r.urgency_source==='channel'?'通道默认':(r.urgency_source==='daily'?'每日额度':(r.urgency_source==='quota'?'官方数据':'默认')))}}</span></td><td class="mono">{{r.remaining==null?'未知':credit(r.remaining)}}</td><td><span class="badge" :class="r.quota_state==='exhausted'?'err':(r.quota_state==='low'?'inactive':'ok')">{{r.quota_state==='exhausted'?'已用尽':(r.quota_state==='low'?'见底':'正常')}}</span></td></tr>
+          </tbody></table>
+          <div v-else class="hint">该通道当前没有可用账号</div>
+        </div>
+      </template>
+    </div>
+  </div>
   <div class="card"><div class="card-h">别名映射<span class="sub">按通道保存，只对该通道的 API Key 生效</span>
       <select class="selectctl" v-model="aliasChannel" aria-label="别名通道" style="margin-left:auto">
         <option v-for="c in channels" :key="c.id" :value="c.id">{{c.display_name||c.id}}</option>
       </select>
     </div>
-    <div class="hint" style="padding:8px 16px">当前通道 {{aliasChannelName}}。自动通道 Key 使用裸别名时，按匹配通道中启用账号的最高优先级选择；同优先级保持默认通道顺序。绑定通道的 Key 或 {{aliasChannel}}/别名固定使用指定通道。</div>
+    <div class="hint" style="padding:8px 16px">当前通道 {{aliasChannelName}}。客户端可发裸别名或 {{aliasChannel}}/别名；请使用绑定此通道的 Key。</div>
     <div style="padding:12px 16px;border-bottom:1px solid var(--border2);display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <input v-model="newKey" placeholder="别名 (如 gpt-4o)" style="flex:1;min-width:140px;padding:5px 8px;border:1px solid #e8e8e8;border-radius:4px;font:inherit;font-size:12px;font-family:var(--mono)"/>
       <span style="color:var(--fg3)">→</span>
@@ -1376,9 +1500,9 @@ createApp({
   </div>
   <div v-if="ld" class="load"><div class="spin"></div></div>
   <div class="card card-p empty" v-else-if="err"><div class="em">!</div><p>{{err}}</p></div>
-  <div class="card" v-else-if="l.length"><table><thead><tr><th>时间</th><th>Key</th><th>账号</th><th>模型</th><th>流</th><th>Prompt</th><th>Completion</th><th>Token</th><th>Credit</th><th>耗时</th><th>状态</th><th></th></tr></thead><tbody>
-    <template v-for="x in l" :key="x.id"><tr><td class="mono">{{fmt(x.created_at)}}</td><td>{{x.api_key_name||'-'}}</td><td>{{x.account_name||'-'}}</td><td><code>{{x.model}}</code><template v-if="x.resolved_model&&x.resolved_model!==x.model"> → <span class="tag">{{x.provider}}</span> <code>{{x.resolved_model}}</code></template></td><td>{{x.stream?'Stream':'-'}}</td><td>{{tok(x.prompt_tokens)}}</td><td>{{tok(x.completion_tokens)}}</td><td>{{tok(x.total_tokens)}}</td><td>{{money(x.credit)}}</td><td>{{ms(x.duration_ms)}}</td><td><span class="badge" :class="statusClass(x)">{{statusText(x)}}</span></td><td><button class="btn s" @click="open=open===x.id?null:x.id">{{open===x.id?'收起':'详情'}}</button></td></tr>
-      <tr class="detail-row" v-if="open===x.id"><td colspan="12"><div class="detail-grid"><div><div class="detail-k">Log ID</div><div class="detail-v">{{x.id}}</div></div><div><div class="detail-k">API Key ID</div><div class="detail-v">{{x.api_key_id||'-'}}</div></div><div><div class="detail-k">Account ID</div><div class="detail-v">{{x.account_id||'-'}}</div></div><div><div class="detail-k">HTTP</div><div class="detail-v">{{x.status_code||'-'}}</div></div></div><div v-if="x.error_msg"><div class="status-line" style="margin-bottom:8px"><strong style="font-size:12px">错误信息</strong><button class="btn s" @click="copyErr(x)">{{copied?'已复制':'复制错误'}}</button></div><div class="errbox">{{x.error_msg}}</div></div><div class="hint" v-else>该请求没有错误信息。</div></td></tr></template>
+  <div class="card" v-else-if="l.length"><table><thead><tr><th>时间</th><th>Key</th><th>账号</th><th>别名→实际模型</th><th>流</th><th>Prompt</th><th>Completion</th><th>Token</th><th>Credit</th><th>耗时</th><th>状态</th><th></th></tr></thead><tbody>
+    <template v-for="x in l" :key="x.id"><tr><td class="mono">{{fmt(x.created_at)}}</td><td>{{x.api_key_name||'-'}}</td><td>{{x.account_name||'-'}}</td><td><code>{{x.model}}</code><template v-if="x.resolved_model && x.resolved_model!==x.model"> → <span class="tag">{{x.provider}}</span> <code>{{x.resolved_model}}</code></template></td><td>{{x.stream?'Stream':'-'}}</td><td>{{tok(x.prompt_tokens)}}</td><td>{{tok(x.completion_tokens)}}</td><td>{{tok(x.total_tokens)}}</td><td>{{money(x.credit)}}</td><td>{{ms(x.duration_ms)}}</td><td><span class="badge" :class="statusClass(x)">{{statusText(x)}}</span></td><td><button class="btn s" @click="open=open===x.id?null:x.id">{{open===x.id?'收起':'详情'}}</button></td></tr>
+      <tr class="detail-row" v-if="open===x.id"><td colspan="12"><div class="detail-grid"><div><div class="detail-k">Log ID</div><div class="detail-v">{{x.id}}</div></div><div><div class="detail-k">API Key ID</div><div class="detail-v">{{x.api_key_id||'-'}}</div></div><div><div class="detail-k">Account ID</div><div class="detail-v">{{x.account_id||'-'}}</div></div><div><div class="detail-k">HTTP</div><div class="detail-v">{{x.status_code||'-'}}</div></div><div><div class="detail-k">客户端模型(别名)</div><div class="detail-v"><code>{{x.model}}</code></div></div><div><div class="detail-k">实际路由模型</div><div class="detail-v"><code>{{x.resolved_model||x.model}}</code></div></div></div><div v-if="x.error_msg"><div class="status-line" style="margin-bottom:8px"><strong style="font-size:12px">错误信息</strong><button class="btn s" @click="copyErr(x)">{{copied?'已复制':'复制错误'}}</button></div><div class="errbox">{{x.error_msg}}</div></div><div class="hint" v-else>该请求没有错误信息。</div></td></tr></template>
   </tbody></table><div class="pager"><button class="btn s" @click="prev" :disabled="f.offset<=0||ld">上一页</button><span class="tag">{{pageText}}</span><button class="btn s" @click="next" :disabled="Number(f.offset)+Number(f.limit)>=Number(meta.total)||ld">下一页</button></div></div>
   <div class="card card-p empty" v-else><div class="em">📋</div><p>暂无记录</p></div>
 </div>`
@@ -1546,7 +1670,7 @@ createApp({
         <div v-if="setupTab==='codex'" style="margin-top:16px;border:1px solid var(--blue-border);border-radius:var(--r);padding:16px;background:var(--blue-soft)">
           <div style="font-weight:600;font-size:14px;margin-bottom:4px">一键配置 Codex</div>
           <div style="font-size:12px;color:var(--fg2);margin-bottom:16px">选择一个 API Key，自动写入 <span class="mono">~/.codex/config.toml</span> 和 <span class="mono">~/.codex/auth.json</span>（原文件备份为 .bak），并设置 <span class="mono">OPENAI_API_KEY</span> 环境变量。配置后需完全关闭 Codex 重新打开。</div>
-          
+
           <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;margin-bottom:12px">
             <div class="field" style="flex:1;min-width:280px;margin:0">
               <label>API Key（sk-cb- 开头）</label>

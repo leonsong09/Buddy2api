@@ -46,6 +46,9 @@ class QClawProvider:
     async def pick_account_with_fallback(
         self, exclude_ids: set[int] | None = None
     ) -> Optional[dict]:
+        if auth_manager.pinned_for(self.id) is not None:
+            # A pinned hop owns exactly one account: never drift to a sibling.
+            return self.pick_account(exclude_ids)
         account = self.pick_account(exclude_ids)
         if account:
             return account

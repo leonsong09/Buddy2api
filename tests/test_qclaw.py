@@ -3,12 +3,12 @@ import hashlib
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 
 import credential_crypto
 import database as db
 import providers
 import router
-from providers.protocol import UnknownChannel
 from providers.qclaw.constants import JPRX_SIGNATURE_KEY, STATIC_MODELS
 from providers.qclaw.chat import _build_body, fill_empty_content
 from providers.qclaw.sign import aizone_headers, jprx_ctx
@@ -143,16 +143,33 @@ def test_parse_credentials_requires_key():
 
 def test_bind_qclaw_is_retired_even_if_listed(monkeypatch):
     monkeypatch.setenv("CB_GATEWAY_PROVIDERS", "workbuddy,qclaw")
-    with pytest.raises(UnknownChannel, match="retired"):
-        router.bind({"model": "auto"}, {"default_channel": "qclaw"})
-    with pytest.raises(UnknownChannel, match="retired"):
-        router.bind({"model": "qclaw/default"}, {"default_channel": "workbuddy"})
+    # A retired prefix is named in the error, so the caller learns why it is gone.
+    with pytest.raises(HTTPException) as err:
+        router.admit_model({"default_channel": "workbuddy"}, "qclaw/default")
+    assert err.value.status_code == 400
+    assert err.value.detail["error"]["code"] == "channel_retired"
+    assert "retired" in err.value.detail["error"]["message"]
+    # A key pinned to qclaw has no prefix of its own, but the pin is still the
+    # reason the request cannot be served — say that, so a legacy key whose
+    # channel retired gets "switch this API key to workbuddy" instead of a
+    # misleading "unknown model".
+    with pytest.raises(HTTPException) as err:
+        router.admit_model({"default_channel": "qclaw"}, "auto")
+    assert err.value.status_code == 400
+    assert err.value.detail["error"]["code"] == "channel_retired"
+    assert "retired" in err.value.detail["error"]["message"]
 
 
-def test_bind_qclaw_disabled_is_unknown_channel(monkeypatch):
+def test_qclaw_prefix_is_rejected_when_the_channel_is_not_enabled(monkeypatch):
     monkeypatch.setenv("CB_GATEWAY_PROVIDERS", "workbuddy")
-    with pytest.raises(UnknownChannel):
-        router.bind({"model": "qclaw/default"}, {"default_channel": "qclaw"})
+    with pytest.raises(HTTPException) as err:
+        router.admit_model({"default_channel": "workbuddy"}, "traework/default")
+    assert err.value.status_code == 400
+    assert err.value.detail["error"]["code"] == "unknown_channel"
+    # Retirement is checked before enablement, so the better message still wins.
+    with pytest.raises(HTTPException) as err:
+        router.admit_model({"default_channel": "qclaw"}, "qclaw/default")
+    assert err.value.detail["error"]["code"] == "channel_retired"
 
 
 def test_qclaw_sources_do_not_touch_workbuddy_stack():

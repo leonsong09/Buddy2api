@@ -18,6 +18,7 @@ from model_reasoning import reasoning_fields
 CATALOG_SETTING = "channel_catalogs"
 REFRESH_SETTING = "channel_catalog_refresh"
 EXTRAS_SETTING = "channel_catalog_extras"
+EXEMPT_SETTING = "channel_quota_exempt"
 
 Fetcher = Callable[[dict], Awaitable[list[dict]]]
 
@@ -94,6 +95,48 @@ def save_extras(channel: str, models: list[dict]) -> None:
     db.set_setting(EXTRAS_SETTING, extras)
 
 
+def exempt_models(channel: str) -> list[str]:
+    """Model ids this channel serves even when an account's quota reads zero.
+
+    The mark is a property of one model on one channel, written from the model
+    configuration page. It exists because a zero balance on a paid wallet says
+    nothing about a model that costs nothing: without it, the zero-quota gate
+    takes the whole channel out of routing and a free model becomes unusable.
+    """
+    items = _load_map(EXEMPT_SETTING).get(channel)
+    if isinstance(items, list):
+        return [str(item).strip() for item in items if str(item or "").strip()]
+    return []
+
+
+def is_exempt(channel: str, model_id: str) -> bool:
+    target = _normalize_model_id(channel, model_id)
+    return bool(target) and target in exempt_models(channel)
+
+
+def set_exempt(channel: str, model_id: str, exempt: bool) -> dict:
+    channel = _require_enabled_channel(channel)
+    mid = _normalize_model_id(channel, model_id)
+    if not mid:
+        raise CatalogError("model id is required")
+    mapping = _load_map(EXEMPT_SETTING)
+    current = [item for item in exempt_models(channel) if item != mid]
+    if exempt:
+        current.append(mid)
+    if current:
+        mapping[channel] = sorted(current)
+    else:
+        mapping.pop(channel, None)
+    db.set_setting(EXEMPT_SETTING, mapping)
+    return {
+        "channel": channel,
+        "id": mid,
+        "exempt": bool(exempt),
+        "exempt_models": exempt_models(channel),
+        "models": _with_manual(channel, current_models(channel)),
+    }
+
+
 def _merge_models(base: list[dict], extra: list[dict]) -> list[dict]:
     return normalize_models(list(base) + list(extra))
 
@@ -106,10 +149,13 @@ def models_for(channel: str, fallback: list[dict]) -> list[dict]:
 
 def _with_manual(channel: str, models: list[dict]) -> list[dict]:
     extra_ids = {str(item.get("id")) for item in extras_for(channel)}
+    exempt_ids = set(exempt_models(channel))
     annotated = []
     for item in models:
         row = dict(item)
-        row["manual"] = str(row.get("id") or "") in extra_ids
+        model_id = str(row.get("id") or "")
+        row["manual"] = model_id in extra_ids
+        row["exempt"] = model_id in exempt_ids
         annotated.append(row)
     return annotated
 

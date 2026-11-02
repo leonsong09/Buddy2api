@@ -86,3 +86,6 @@ desktop.ini
 
 # Ant Code composer uploads
 ant-code-uploads/
+
+# pytest temp dirs
+pytest-of-Administrator/
