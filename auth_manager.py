@@ -1070,9 +1070,17 @@ async def fetch_checkin_status(
     try:
         async with httpx.AsyncClient(timeout=request_timeout(20)) as c:
             r = await c.post(f"{backend_url(account)}/v2/billing/meter/checkin-activity-status", headers=headers, json={})
-            data = r.json()
-    except (httpx.HTTPError, ValueError) as e:
-        return _checkin_failure(account, status_code=0, message=str(e)[:240], allow_stale=allow_stale)
+    except httpx.HTTPError as e:
+        return _checkin_failure(account, status_code=0,
+                                message=f"查询签到状态：网络请求失败（{type(e).__name__}）",
+                                allow_stale=allow_stale)
+
+    try:
+        data = r.json()
+    except ValueError:
+        return _checkin_failure(account, status_code=r.status_code,
+                                message=_checkin_response_error(r, "查询签到状态"),
+                                allow_stale=allow_stale)
 
     ok, msg, payload = _unwrap_response(data)
     if r.status_code < 200 or r.status_code >= 300:
@@ -1094,6 +1102,30 @@ async def fetch_checkin_status(
     if not ok:
         return _checkin_failure(account, status_code=r.status_code, message=msg, allow_stale=allow_stale)
     return result
+
+
+def _checkin_response_error(response: httpx.Response, stage: str) -> str:
+    """Describe malformed replies without exposing bodies, URLs or credentials."""
+    body = response.text.strip()
+    content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+    if not body:
+        kind = "空响应"
+    elif "html" in content_type or body[:64].lower().startswith(("<!doctype html", "<html")):
+        kind = "HTML 页面，非 JSON"
+    else:
+        kind = "非 JSON 响应"
+    status = response.status_code
+    if 300 <= status < 400:
+        hint = "接口发生重定向，请检查登录状态或网络代理"
+    elif status in {401, 403}:
+        hint = "请求被拒绝，请检查登录状态或上游访问限制"
+    elif status == 429:
+        hint = "请求过于频繁，请稍后重试"
+    elif status >= 500:
+        hint = "上游或网络网关异常，请稍后重试并检查代理"
+    else:
+        hint = "请重试，并检查上游接口或网络代理"
+    return f"{stage}：HTTP {status}，{kind}；{hint}"
 
 
 async def claim_daily_checkin(account: dict) -> dict:
@@ -1124,9 +1156,15 @@ async def claim_daily_checkin(account: dict) -> dict:
     try:
         async with httpx.AsyncClient(timeout=request_timeout(30)) as c:
             r = await c.post(f"{backend_url(account)}/v2/billing/meter/daily-checkin", headers=headers, json={})
-            data = r.json()
-    except (httpx.HTTPError, ValueError) as e:
-        return _checkin_result(account, ok=False, status_code=0, message=str(e)[:240])
+    except httpx.HTTPError as e:
+        return _checkin_result(account, ok=False, status_code=0,
+                               message=f"领取积分：网络请求失败（{type(e).__name__}）")
+
+    try:
+        data = r.json()
+    except ValueError:
+        return _checkin_result(account, ok=False, status_code=r.status_code,
+                               message=_checkin_response_error(r, "领取积分"))
 
     ok, msg, payload = _unwrap_response(data)
     if r.status_code < 200 or r.status_code >= 300:
